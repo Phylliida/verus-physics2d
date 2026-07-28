@@ -185,6 +185,53 @@ pub proof fn lemma_raw_neg_mul_neg(a: Rational, b: Rational)
     assert(a.mul_spec(b.neg_spec()).neg_spec() == a.mul_spec(b).neg_spec().neg_spec());
 }
 
+/// raw: −(x − y) == y − x (structural).
+pub proof fn lemma_raw_neg_sub(x: Rational, y: Rational)
+    ensures
+        x.sub_spec(y).neg_spec() == y.sub_spec(x),
+{
+    // sub_spec(x, y) = x.add(y.neg()); both sides unfold to add_spec with
+    // the same den (x.den·y.den + x.den + y.den) and negated nums.
+    let lhs = x.sub_spec(y).neg_spec();
+    let rhs = y.sub_spec(x);
+    assert(lhs.num == -(x.num * y.denom() + (-y.num) * x.denom()));
+    assert(rhs.num == y.num * x.denom() + (-x.num) * y.denom());
+    // NLA only on fully-unfolded int/nat terms (spec-fn terms are opaque
+    // to by(nonlinear_arith) — R3)
+    assert(lhs.den == x.den * y.den + x.den + y.den);
+    assert(rhs.den == y.den * x.den + y.den + x.den);
+    assert(x.den * y.den == y.den * x.den) by (nonlinear_arith);
+    assert(lhs.den == rhs.den);
+    assert((-x.num) * y.denom() == -(x.num * y.denom())) by (nonlinear_arith);
+    assert((-y.num) * x.denom() == -(y.num * x.denom())) by (nonlinear_arith);
+    assert(lhs.num == rhs.num);
+    assert(lhs == rhs);
+}
+
+/// raw: (−1)·x == −x (structural).
+pub proof fn lemma_raw_neg_one_mul(x: Rational)
+    ensures
+        Rational::from_int_spec(-1).mul_spec(x) == x.neg_spec(),
+{
+    let mone = Rational::from_int_spec(-1);
+    let lhs = mone.mul_spec(x);
+    assert(mone.num == -1);
+    assert(mone.den == 0);
+    assert(lhs.num == -1 * x.num);
+    assert(lhs.den == 0 * x.den + 0 + x.den);
+    assert(lhs.num == x.neg_spec().num);
+    assert(lhs.den == x.neg_spec().den);
+    assert(lhs == x.neg_spec());
+}
+
+/// raw: (−x)/y == −(x/y) (structural; div is mul by reciprocal).
+pub proof fn lemma_raw_neg_div(x: Rational, y: Rational)
+    ensures
+        x.neg_spec().div_spec(y) == x.div_spec(y).neg_spec(),
+{
+    lemma_raw_neg_mul_left(x, y.reciprocal_spec());
+}
+
 /// raw: congruence of abs nonneg — |x| ≥ 0
 pub proof fn lemma_raw_abs_nonneg(x: Rational)
     ensures

@@ -48,3 +48,6 @@ pub mod massprops;
 
 #[cfg(verus_keep_ghost)]
 pub mod broadphase;
+
+#[cfg(verus_keep_ghost)]
+pub mod row;

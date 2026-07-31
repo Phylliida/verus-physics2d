@@ -23,4 +23,10 @@ pub mod massprops;
 pub mod broadphase;
 
 #[cfg(verus_keep_ghost)]
+pub mod cert;
+
+#[cfg(verus_keep_ghost)]
 pub mod row;
+
+#[cfg(verus_keep_ghost)]
+pub mod world;

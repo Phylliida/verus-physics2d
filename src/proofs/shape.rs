@@ -362,6 +362,41 @@ pub proof fn lemma_min_pos_all(
         crate::shape::axis_sep(n, p, qs[j]));
 }
 
+/// A lower bound on every element is a lower bound on the min fold.
+pub proof fn lemma_min_sep_ge_all(
+    n: Vec2<Rational>, p: Vec2<Rational>, qs: Seq<Vec2<Rational>>, i: int, lo: Rational,
+)
+    requires
+        0 <= i < qs.len(),
+        forall|j: int|
+            i <= j < qs.len() ==> lo.le_spec(#[trigger] crate::shape::axis_sep(n, p, qs[j])),
+    ensures
+        lo.le_spec(crate::shape::min_sep(n, p, qs, i)),
+    decreases qs.len() - i,
+{
+    use crate::shape::{axis_sep, min_sep};
+    if i < qs.len() - 1 {
+        assert(min_sep(n, p, qs, i)
+            == Rational::min_spec(axis_sep(n, p, qs[i]), min_sep(n, p, qs, i + 1))) by {
+            reveal_with_fuel(min_sep, 2);
+        }
+        lemma_min_sep_ge_all(n, p, qs, i + 1, lo);
+        let a = axis_sep(n, p, qs[i]);
+        let b = min_sep(n, p, qs, i + 1);
+        Rational::lemma_trichotomy(a, b);
+        Rational::lemma_le_iff_lt_or_eqv(a, b);
+        if a.le_spec(b) {
+            assert(Rational::min_spec(a, b) == a);
+        } else {
+            assert(Rational::min_spec(a, b) == b);
+        }
+    } else {
+        assert(min_sep(n, p, qs, i) == axis_sep(n, p, qs[i])) by {
+            reveal_with_fuel(min_sep, 2);
+        }
+    }
+}
+
 /// Translation cancels in differences: (a + t) − (b + t) ≡ a − b (per
 /// coordinate; one cross-multiplied identity).
 pub proof fn lemma_sub_spec_translation(

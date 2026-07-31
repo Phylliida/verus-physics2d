@@ -15,8 +15,10 @@ use verus_linalg::runtime::vec2::RuntimeVec2;
 use verus_linalg::vec2::Vec2;
 use verus_rational::{Rational, RuntimeRational};
 
-use crate::narrowphase::{sat_classify, SatResult};
-use crate::shape::{convex_poly_inv, orient, vadd, vcross2, Compound, ConvexPoly};
+use crate::narrowphase::{no_axis_separates, sat_classify, SatResult};
+use crate::shape::{
+    axis_sep, convex_poly_inv, edge_normal, min_sep, orient, vadd, vcross2, Compound, ConvexPoly,
+};
 use crate::massprops::{
     centroid_exec, centroid_num, centroid_num_chain, centroid_spec, chain_cross_sum, cross_sum,
     inertia0_exec, inertia0_spec, inertia_edge_term, inertia_num, inertia_num_chain,
@@ -24,12 +26,23 @@ use crate::massprops::{
 };
 use crate::angle_ledger::{arctan_term, t_in_symmetric_unit_interval, two_x};
 use crate::body::Body;
+use crate::broadphase::world_verts;
+use crate::certificate::{
+    body_world_verts, c4_touch_witness, check_contact_step, contact_checks_pass,
+    contact_step_certified,
+};
 use crate::momentum::{ang_mom, ang_mom_exec, lin_mom_x, lin_mom_y, lin_mom_exec};
 use crate::proofs::angle_ledger::{
     lemma_arctan_term_abs_bound, lemma_two_mul_monotone, lemma_unit_implies_symmetric,
 };
 use crate::proofs::momentum::{grav_zero, lemma_step_preserves_momentum};
+use crate::proofs::row::{lemma_eff_mass_pos_linear_a, lemma_solve_row_c3, lemma_vdot_neg_self};
+use crate::proofs::shape::{lemma_min_sep_ge_all, lemma_min_sep_le_all};
 use crate::rotq::RotQ;
+use crate::row::{
+    apply_impulse_exec, bounds_consistent, clamp_spec, contact_row_exec, eff_mass_exec,
+    eff_mass_spec, row_vel_spec, Row, solve_row_lambda_exec, vel_after_impulse,
+};
 use crate::step::{
     body_step_rel, half_angle_model, ledger_increment, lemma_series_neg_unit_interval,
     lemma_series_unit_interval, step_free_flight, tan_half_series_model, StepResult,
@@ -2163,6 +2176,698 @@ pub fn scene_s3() -> (out: bool)
         k = k + 1;
     }
     true
+}
+
+// ── S4 (phys-05d): head-on equal-mass squares through the certificate ──
+
+/// The side-2 square at the origin, ccw. Side 2 keeps every anchor
+/// integral (center (1,1), contact (2,1)), so the closed evaluation of
+/// the impulse arithmetic stays STRUCTURAL (no frac dens).
+pub open spec fn square2() -> Seq<Vec2<Rational>> {
+    seq![iv2(0, 0), iv2(2, 0), iv2(2, 2), iv2(0, 2)]
+}
+
+/// The side-2 square at (2, 0) — B in world space, touching A's right face.
+pub open spec fn square2b() -> Seq<Vec2<Rational>> {
+    seq![iv2(2, 0), iv2(4, 0), iv2(4, 2), iv2(2, 2)]
+}
+
+/// square2 is convex (every non-endpoint orient == 4).
+pub proof fn lemma_square2_convex()
+    ensures
+        convex_poly_inv(square2()),
+{
+    let a = square2();
+    assert(a.len() == 4);
+    assert(a.len() >= 3);
+    assert forall|i: int, j: int|
+        (0 <= i < 4 && 0 <= j < 4 && j != i && j != (i + 1) % (4 as int))
+        implies Rational::from_int_spec(0).lt_spec(
+            #[trigger] orient(a[i], a[(i + 1) % (4 as int)], a[j]))
+    by {
+        assert((i == 0 && j == 2) || (i == 0 && j == 3)
+            || (i == 1 && j == 0) || (i == 1 && j == 3)
+            || (i == 2 && j == 0) || (i == 2 && j == 1)
+            || (i == 3 && j == 1) || (i == 3 && j == 2)
+            || j == i || j == (i + 1) % (4 as int));
+        if i == 0 && j == 2 {
+            lemma_orient_closed(0, 0, 2, 0, 2, 2);
+        } else if i == 0 && j == 3 {
+            lemma_orient_closed(0, 0, 2, 0, 0, 2);
+        } else if i == 1 && j == 0 {
+            lemma_orient_closed(2, 0, 2, 2, 0, 0);
+        } else if i == 1 && j == 3 {
+            lemma_orient_closed(2, 0, 2, 2, 0, 2);
+        } else if i == 2 && j == 0 {
+            lemma_orient_closed(2, 2, 0, 2, 0, 0);
+        } else if i == 2 && j == 1 {
+            lemma_orient_closed(2, 2, 0, 2, 2, 0);
+        } else if i == 3 && j == 1 {
+            lemma_orient_closed(0, 2, 0, 0, 2, 0);
+        } else if i == 3 && j == 2 {
+            lemma_orient_closed(0, 2, 0, 0, 2, 2);
+        } else {
+            assert(j == i || j == (i + 1) % (4 as int));
+        }
+        assert(a[0] == iv2(0, 0));
+        assert(a[1] == iv2(2, 0));
+        assert(a[2] == iv2(2, 2));
+        assert(a[3] == iv2(0, 2));
+        assert(orient(a[i], a[(i + 1) % (4 as int)], a[j]) == Rational::from_int_spec(4));
+        Rational::lemma_from_int_preserves_lt(0, 4);
+    }
+    assert(convex_poly_inv(a));
+}
+
+/// square2b is convex (every non-endpoint orient == 4).
+pub proof fn lemma_square2b_convex()
+    ensures
+        convex_poly_inv(square2b()),
+{
+    let a = square2b();
+    assert(a.len() == 4);
+    assert(a.len() >= 3);
+    assert forall|i: int, j: int|
+        (0 <= i < 4 && 0 <= j < 4 && j != i && j != (i + 1) % (4 as int))
+        implies Rational::from_int_spec(0).lt_spec(
+            #[trigger] orient(a[i], a[(i + 1) % (4 as int)], a[j]))
+    by {
+        assert((i == 0 && j == 2) || (i == 0 && j == 3)
+            || (i == 1 && j == 0) || (i == 1 && j == 3)
+            || (i == 2 && j == 0) || (i == 2 && j == 1)
+            || (i == 3 && j == 1) || (i == 3 && j == 2)
+            || j == i || j == (i + 1) % (4 as int));
+        if i == 0 && j == 2 {
+            lemma_orient_closed(2, 0, 4, 0, 4, 2);
+        } else if i == 0 && j == 3 {
+            lemma_orient_closed(2, 0, 4, 0, 2, 2);
+        } else if i == 1 && j == 0 {
+            lemma_orient_closed(4, 0, 4, 2, 2, 0);
+        } else if i == 1 && j == 3 {
+            lemma_orient_closed(4, 0, 4, 2, 2, 2);
+        } else if i == 2 && j == 0 {
+            lemma_orient_closed(4, 2, 2, 2, 2, 0);
+        } else if i == 2 && j == 1 {
+            lemma_orient_closed(4, 2, 2, 2, 4, 0);
+        } else if i == 3 && j == 1 {
+            lemma_orient_closed(2, 2, 2, 0, 4, 0);
+        } else if i == 3 && j == 2 {
+            lemma_orient_closed(2, 2, 2, 0, 4, 2);
+        } else {
+            assert(j == i || j == (i + 1) % (4 as int));
+        }
+        assert(a[0] == iv2(2, 0));
+        assert(a[1] == iv2(4, 0));
+        assert(a[2] == iv2(4, 2));
+        assert(a[3] == iv2(2, 2));
+        assert(orient(a[i], a[(i + 1) % (4 as int)], a[j]) == Rational::from_int_spec(4));
+        Rational::lemma_from_int_preserves_lt(0, 4);
+    }
+    assert(convex_poly_inv(a));
+}
+
+/// Side-2-square compound (one convex part) for the S4 bodies.
+pub fn square2_compound() -> (out: Compound)
+    ensures
+        out.wf_spec(),
+        out.model_parts().len() == 1,
+        out.model_parts()[0] == square2(),
+{
+    let mut va: Vec<SVec2> = Vec::new();
+    va.push(RuntimeVec2::new(RuntimeRational::from_int(0), RuntimeRational::from_int(0)));
+    va.push(RuntimeVec2::new(RuntimeRational::from_int(2), RuntimeRational::from_int(0)));
+    va.push(RuntimeVec2::new(RuntimeRational::from_int(2), RuntimeRational::from_int(2)));
+    va.push(RuntimeVec2::new(RuntimeRational::from_int(0), RuntimeRational::from_int(2)));
+    let pa_opt = ConvexPoly::new_checked(va);
+    proof {
+        lemma_square2_convex();
+        assert(pa_opt is Some);
+    }
+    let pa = pa_opt.unwrap();
+    let mut parts: Vec<ConvexPoly> = Vec::new();
+    parts.push(pa);
+    let out = Compound::new(parts);
+    proof {
+        assert(out.model_parts().len() == 1);
+        assert(out.model_parts()[0] == pa.model_verts());
+        assert(out.model_parts()[0] == square2());
+    }
+    out
+}
+
+/// world_verts of square2 at identity rotation, pos (0,0) / (2,0) —
+/// structural: every component evaluates to the literal via the
+/// *_closed_int helpers (1·x == x, 0·x == 0, sub/add of from_ints).
+pub proof fn lemma_s4_world_verts()
+    ensures
+        world_verts(
+            iv2(0, 0), Rational::from_int_spec(1), Rational::from_int_spec(0), square2())
+            == square2(),
+        world_verts(
+            iv2(2, 0), Rational::from_int_spec(1), Rational::from_int_spec(0), square2())
+            == square2b(),
+{
+    let one = Rational::from_int_spec(1);
+    let zero = Rational::from_int_spec(0);
+    lemma_raw_mul_closed_int(1, 0);
+    lemma_raw_mul_closed_int(1, 2);
+    lemma_raw_mul_closed_int(1, 4);
+    lemma_raw_mul_closed_int(0, 0);
+    lemma_raw_mul_closed_int(0, 2);
+    lemma_raw_mul_closed_int(0, 4);
+    lemma_raw_sub_closed_int(0, 0);
+    lemma_raw_sub_closed_int(2, 0);
+    lemma_raw_sub_closed_int(4, 0);
+    lemma_raw_add_closed_int(0, 0);
+    lemma_raw_add_closed_int(2, 0);
+    lemma_raw_add_closed_int(4, 0);
+    lemma_raw_add_closed_int(0, 2);
+    lemma_raw_add_closed_int(2, 2);
+    lemma_raw_add_closed_int(4, 2);
+    // A: pos (0,0) — each world vert == the local vert
+    let wa = world_verts(iv2(0, 0), one, zero, square2());
+    assert(wa.len() == 4);
+    assert(wa[0] == iv2(0, 0));
+    assert(wa[1] == iv2(2, 0));
+    assert(wa[2] == iv2(2, 2));
+    assert(wa[3] == iv2(0, 2));
+    assert(wa =~= square2());
+    // B: pos (2,0) — each world vert == square2b's literal
+    let wb = world_verts(iv2(2, 0), one, zero, square2());
+    assert(wb.len() == 4);
+    assert(wb[0] == iv2(2, 0));
+    assert(wb[1] == iv2(4, 0));
+    assert(wb[2] == iv2(4, 2));
+    assert(wb[3] == iv2(2, 2));
+    assert(wb =~= square2b());
+}
+
+/// Closed axis_sep on from_int points (structural).
+proof fn lemma_s4_axis_sep_closed(
+    nx: int,
+    ny: int,
+    px: int,
+    py: int,
+    qx: int,
+    qy: int,
+)
+    ensures
+        axis_sep(iv2(nx, ny), iv2(px, py), iv2(qx, qy))
+            == Rational::from_int_spec(nx * (qx - px) + ny * (qy - py)),
+{
+    lemma_raw_sub_closed_int(qx, px);
+    lemma_raw_sub_closed_int(qy, py);
+    lemma_raw_mul_closed_int(nx, qx - px);
+    lemma_raw_mul_closed_int(ny, qy - py);
+    lemma_raw_add_closed_int(nx * (qx - px), ny * (qy - py));
+}
+
+/// S4 C4 facts on the literal world polys: A and B share a face (no axis
+/// separates, one zero-sep witness per edge) and A's right edge (edge 1)
+/// has every B vertex on its outer side (sep ≥ 0 — the depth witness).
+pub proof fn lemma_s4_c4_facts()
+    ensures
+        no_axis_separates(square2(), square2b()),
+        c4_touch_witness(square2(), square2b(), Rational::from_int_spec(0), true, 1),
+{
+    let a = square2();
+    let b = square2b();
+    assert(a[0] == iv2(0, 0));
+    assert(a[1] == iv2(2, 0));
+    assert(a[2] == iv2(2, 2));
+    assert(a[3] == iv2(0, 2));
+    assert(b[0] == iv2(2, 0));
+    assert(b[1] == iv2(4, 0));
+    assert(b[2] == iv2(4, 2));
+    assert(b[3] == iv2(2, 2));
+    let z = Rational::from_int_spec(0);
+    // A's edges: min_sep ≤ the witness vertex's sep ≤ 0
+    // e0: (0,0)→(2,0), n = (0,−2), witness B[0] = (2,0): sep == 0
+    lemma_s4_axis_sep_closed(0, -2, 0, 0, 2, 0);
+    lemma_min_sep_le_all(edge_normal(a[0], a[1]), a[0], b, 0, 0);
+    Rational::lemma_from_int_preserves_le(0, 0);
+    Rational::lemma_le_transitive(
+        min_sep(edge_normal(a[0], a[1]), a[0], b, 0),
+        axis_sep(edge_normal(a[0], a[1]), a[0], b[0]),
+        z);
+    // e1: (2,0)→(2,2), n = (2,0), witness B[0]: sep == 0
+    lemma_s4_axis_sep_closed(2, 0, 2, 0, 2, 0);
+    lemma_min_sep_le_all(edge_normal(a[1], a[2]), a[1], b, 0, 0);
+    Rational::lemma_le_transitive(
+        min_sep(edge_normal(a[1], a[2]), a[1], b, 0),
+        axis_sep(edge_normal(a[1], a[2]), a[1], b[0]),
+        z);
+    // e2: (2,2)→(0,2), n = (0,2), witness B[3]: sep == 0
+    lemma_s4_axis_sep_closed(0, 2, 2, 2, 2, 2);
+    lemma_min_sep_le_all(edge_normal(a[2], a[3]), a[2], b, 0, 3);
+    Rational::lemma_le_transitive(
+        min_sep(edge_normal(a[2], a[3]), a[2], b, 0),
+        axis_sep(edge_normal(a[2], a[3]), a[2], b[3]),
+        z);
+    // e3: (0,2)→(0,0), n = (−2,0), witness B[0]: sep == −4
+    lemma_s4_axis_sep_closed(-2, 0, 0, 2, 2, 0);
+    lemma_min_sep_le_all(edge_normal(a[3], a[0]), a[3], b, 0, 0);
+    Rational::lemma_from_int_preserves_le(-4, 0);
+    Rational::lemma_le_transitive(
+        min_sep(edge_normal(a[3], a[0]), a[3], b, 0),
+        axis_sep(edge_normal(a[3], a[0]), a[3], b[0]),
+        z);
+    // B's edges (other = A)
+    // e0: (2,0)→(4,0), n = (0,−2), witness A[0]: sep == 0
+    lemma_s4_axis_sep_closed(0, -2, 2, 0, 0, 0);
+    lemma_min_sep_le_all(edge_normal(b[0], b[1]), b[0], a, 0, 0);
+    Rational::lemma_le_transitive(
+        min_sep(edge_normal(b[0], b[1]), b[0], a, 0),
+        axis_sep(edge_normal(b[0], b[1]), b[0], a[0]),
+        z);
+    // e1: (4,0)→(4,2), n = (2,0), witness A[2]: sep == −4
+    lemma_s4_axis_sep_closed(2, 0, 4, 0, 2, 2);
+    lemma_min_sep_le_all(edge_normal(b[1], b[2]), b[1], a, 0, 2);
+    Rational::lemma_le_transitive(
+        min_sep(edge_normal(b[1], b[2]), b[1], a, 0),
+        axis_sep(edge_normal(b[1], b[2]), b[1], a[2]),
+        z);
+    // e2: (4,2)→(2,2), n = (0,2), witness A[2]: sep == 0
+    lemma_s4_axis_sep_closed(0, 2, 4, 2, 2, 2);
+    lemma_min_sep_le_all(edge_normal(b[2], b[3]), b[2], a, 0, 2);
+    Rational::lemma_le_transitive(
+        min_sep(edge_normal(b[2], b[3]), b[2], a, 0),
+        axis_sep(edge_normal(b[2], b[3]), b[2], a[2]),
+        z);
+    // e3: (2,2)→(2,0), n = (−2,0), witness A[1]: sep == 0
+    lemma_s4_axis_sep_closed(-2, 0, 2, 2, 2, 0);
+    lemma_min_sep_le_all(edge_normal(b[3], b[0]), b[3], a, 0, 1);
+    Rational::lemma_le_transitive(
+        min_sep(edge_normal(b[3], b[0]), b[3], a, 0),
+        axis_sep(edge_normal(b[3], b[0]), b[3], a[1]),
+        z);
+    assert(no_axis_separates(a, b)) by {
+        assert(a.len() == 4);
+        assert(b.len() == 4);
+        assert forall|e: int|
+            0 <= e < 4 implies #[trigger] min_sep(
+                edge_normal(a[e], a[(e + 1) % (4 as int)]), a[e], b, 0).le_spec(z)
+        by {
+            assert(e == 0 || e == 1 || e == 2 || e == 3);
+        };
+        assert forall|e: int|
+            0 <= e < 4 implies #[trigger] min_sep(
+                edge_normal(b[e], b[(e + 1) % (4 as int)]), b[e], a, 0).le_spec(z)
+        by {
+            assert(e == 0 || e == 1 || e == 2 || e == 3);
+        };
+    };
+    // depth witness: A's edge 1 — every B vertex has sep ≥ 0
+    assert forall|j: int|
+        0 <= j < 4 implies z.le_spec(
+            #[trigger] axis_sep(edge_normal(a[1], a[2]), a[1], b[j]))
+    by {
+        assert(j == 0 || j == 1 || j == 2 || j == 3);
+        if j == 0 {
+            lemma_s4_axis_sep_closed(2, 0, 2, 0, 2, 0);
+        } else if j == 1 {
+            lemma_s4_axis_sep_closed(2, 0, 2, 0, 4, 0);
+        } else if j == 2 {
+            lemma_s4_axis_sep_closed(2, 0, 2, 0, 4, 2);
+        } else {
+            lemma_s4_axis_sep_closed(2, 0, 2, 0, 2, 2);
+        }
+        if j == 1 || j == 2 {
+            Rational::lemma_from_int_preserves_le(0, 4);
+        }
+    };
+    lemma_min_sep_ge_all(edge_normal(a[1], a[2]), a[1], b, 0, z);
+    assert(z.neg_spec() == z);
+    assert(c4_touch_witness(a, b, z, true, 1));
+}
+
+/// Closed impulse arithmetic for S4: v_rel == −1, mEff == 2, λ == 1/2
+/// (all structural — the scene's eq claims become reflexive bridges).
+pub proof fn lemma_s4_impulse_closed(
+    jla: Vec2<Rational>,
+    jaa: Rational,
+    jlb: Vec2<Rational>,
+    jab: Rational,
+    va: Vec2<Rational>,
+    wa: Rational,
+    vb: Vec2<Rational>,
+    wb: Rational,
+    inv_m: Rational,
+    inv_i: Rational,
+)
+    requires
+        jla == iv2(-1, 0),
+        jlb == iv2(1, 0),
+        jaa == Rational::from_int_spec(0),
+        jab == Rational::from_int_spec(0),
+        va == iv2(0, 0),
+        wa == Rational::from_int_spec(0),
+        vb == iv2(-1, 0),
+        wb == Rational::from_int_spec(0),
+        inv_m == Rational::from_int_spec(1),
+        inv_i == Rational::from_int_spec(1),
+    ensures
+        row_vel_spec(jla, jaa, jlb, jab, va, wa, vb, wb) == Rational::from_int_spec(-1),
+        eff_mass_spec(jla, jaa, jlb, jab, inv_m, inv_i, inv_m, inv_i)
+            == Rational::from_int_spec(2),
+        clamp_spec(
+            Rational::from_int_spec(0).sub_spec(
+                row_vel_spec(jla, jaa, jlb, jab, va, wa, vb, wb)
+                    .add_spec(Rational::from_int_spec(0)).div_spec(
+                        eff_mass_spec(jla, jaa, jlb, jab, inv_m, inv_i, inv_m, inv_i))),
+            Option::Some(Rational::from_int_spec(0)),
+            Option::None,
+        ) == Rational::from_frac_spec(1, 2),
+{
+    // v_rel: dot(jla, va) == 0, jaa·wa == 0, dot(jlb, vb) == −1, jab·wb == 0
+    lemma_raw_mul_closed_int(-1, 0);
+    lemma_raw_mul_closed_int(0, 0);
+    lemma_raw_add_closed_int(0, 0);
+    assert(vdot(jla, va) == Rational::from_int_spec(0));
+    assert(jaa.mul_spec(wa) == Rational::from_int_spec(0));
+    lemma_raw_mul_closed_int(1, -1);
+    lemma_raw_add_closed_int(-1, 0);
+    assert(vdot(jlb, vb) == Rational::from_int_spec(-1));
+    assert(jab.mul_spec(wb) == Rational::from_int_spec(0));
+    assert(row_vel_spec(jla, jaa, jlb, jab, va, wa, vb, wb)
+        == Rational::from_int_spec(-1));
+    // meff: dot(jla, jla) == dot(jlb, jlb) == 1, jaa² == jab² == 0
+    lemma_raw_mul_closed_int(-1, -1);
+    lemma_raw_add_closed_int(1, 0);
+    assert(vdot(jla, jla) == Rational::from_int_spec(1));
+    lemma_raw_mul_closed_int(1, 1);
+    assert(vdot(jlb, jlb) == Rational::from_int_spec(1));
+    assert(jaa.mul_spec(jaa) == Rational::from_int_spec(0));
+    assert(jab.mul_spec(jab) == Rational::from_int_spec(0));
+    lemma_raw_mul_closed_int(0, 1);
+    lemma_raw_add_closed_int(1, 1);
+    lemma_raw_add_closed_int(2, 0);
+    assert(eff_mass_spec(jla, jaa, jlb, jab, inv_m, inv_i, inv_m, inv_i)
+        == Rational::from_int_spec(2));
+    // clamp argument: 0 − (((−1) + 0) / 2) == 1/2
+    lemma_raw_add_closed_int(-1, 0);
+    let two = Rational::from_int_spec(2);
+    assert(two.num == 2);
+    assert(two.denom() == 1);
+    assert(two.reciprocal_spec().num == 1);
+    assert(two.reciprocal_spec().den == 1);
+    assert(two.reciprocal_spec() == Rational::from_frac_spec(1, 2));
+    let vr = Rational::from_int_spec(-1);
+    assert(vr.mul_spec(Rational::from_frac_spec(1, 2)).num == -1);
+    assert(vr.mul_spec(Rational::from_frac_spec(1, 2)).den == 1);
+    assert(vr.mul_spec(Rational::from_frac_spec(1, 2)) == Rational::from_frac_spec(-1, 2));
+    let x = Rational::from_int_spec(0).sub_spec(Rational::from_frac_spec(-1, 2));
+    assert(x.num == 1);
+    assert(x.den == 1);
+    assert(x == Rational::from_frac_spec(1, 2));
+    // clamp: 1/2 < 0 is false; hi is None
+    assert(!x.lt_spec(Rational::from_int_spec(0))) by {
+        assert(x.num == 1);
+        assert(x.denom() == 2);
+        assert(Rational::from_int_spec(0).num == 0);
+    };
+    assert(clamp_spec(
+        Rational::from_int_spec(0).sub_spec(
+            row_vel_spec(jla, jaa, jlb, jab, va, wa, vb, wb)
+                .add_spec(Rational::from_int_spec(0)).div_spec(
+                    eff_mass_spec(jla, jaa, jlb, jab, inv_m, inv_i, inv_m, inv_i))),
+        Option::Some(Rational::from_int_spec(0)),
+        Option::None,
+    ) == Rational::from_frac_spec(1, 2));
+}
+
+/// S4 (phys-05d, SPEC §8): head-on equal-mass squares, e = 0 — one
+/// certified single-contact-impulse step. B (side-2 square at (2,0),
+/// velocity (−1,0)) strikes A (same square at origin, at rest) through
+/// their shared face x = 2. After the impulse both velocities are EXACTLY
+/// (−1/2, 0): the common velocity — momentum preserved exactly
+/// (1·0 + 1·(−1) == 2·(−1/2)). The step goes through the certificate
+/// (§3.7(b)): check_contact_step re-computes C1–C4 on the produced
+/// state and the scene proves it accepts.
+pub fn scene_s4() -> (out: bool)
+    ensures
+        out == true,
+{
+    let a = Body::new_dynamic(
+        RuntimeVec2::new(RuntimeRational::from_int(0), RuntimeRational::from_int(0)),
+        RotQ::identity(),
+        RuntimeVec2::new(RuntimeRational::from_int(0), RuntimeRational::from_int(0)),
+        RuntimeRational::from_int(0),
+        RuntimeRational::from_int(1),
+        RuntimeRational::from_int(1),
+        square2_compound(),
+    );
+    let b = Body::new_dynamic(
+        RuntimeVec2::new(RuntimeRational::from_int(2), RuntimeRational::from_int(0)),
+        RotQ::identity(),
+        RuntimeVec2::new(RuntimeRational::from_int(-1), RuntimeRational::from_int(0)),
+        RuntimeRational::from_int(0),
+        RuntimeRational::from_int(1),
+        RuntimeRational::from_int(1),
+        square2_compound(),
+    );
+    proof {
+        lemma_closed_nonneg_one();
+    }
+    // contact row on the shared face: n = (1,0) from a toward b,
+    // r_a = (1,0), r_b = (−1,0) (contact at the face midpoint (2,1))
+    let n = RuntimeVec2::new(RuntimeRational::from_int(1), RuntimeRational::from_int(0));
+    let ra = RuntimeVec2::new(RuntimeRational::from_int(1), RuntimeRational::from_int(0));
+    let rb = RuntimeVec2::new(RuntimeRational::from_int(-1), RuntimeRational::from_int(0));
+    let row = contact_row_exec(0, 1, &n, &ra, &rb);
+    let meff = eff_mass_exec(&row, &a, &b);
+    proof {
+        // row model pins
+        assert(row.jla.model@ == iv2(-1, 0)) by {
+            lemma_raw_mul_closed_int(-1, 1);
+            lemma_raw_mul_closed_int(-1, 0);
+        };
+        assert(row.jlb.model@ == iv2(1, 0));
+        assert(row.jaa@ == Rational::from_int_spec(0)) by {
+            lemma_raw_mul_closed_int(1, 0);
+            lemma_raw_mul_closed_int(0, 1);
+            lemma_raw_sub_closed_int(0, 0);
+            assert(crate::momentum::vcross(iv2(1, 0), iv2(1, 0)) == Rational::from_int_spec(0));
+            assert(Rational::from_int_spec(0).neg_spec() == Rational::from_int_spec(0));
+        };
+        assert(row.jab@ == Rational::from_int_spec(0)) by {
+            lemma_raw_mul_closed_int(-1, 0);
+            lemma_raw_mul_closed_int(0, 1);
+            lemma_raw_sub_closed_int(0, 0);
+            assert(crate::momentum::vcross(iv2(-1, 0), iv2(1, 0)) == Rational::from_int_spec(0));
+        };
+        // meff > 0: dynamic endpoint with nonzero linear J block
+        lemma_vdot_neg_self(iv2(1, 0));
+        lemma_raw_mul_closed_int(1, 1);
+        lemma_raw_mul_closed_int(0, 0);
+        lemma_raw_add_closed_int(1, 0);
+        assert(vdot(iv2(1, 0), iv2(1, 0)) == Rational::from_int_spec(1));
+        Rational::lemma_from_int_preserves_lt(0, 1);
+        Rational::lemma_from_int_preserves_le(0, 1);
+        lemma_eff_mass_pos_linear_a(
+            row.jla.model@, row.jaa@, row.jlb.model@, row.jab@,
+            a.inv_mass@, a.inv_inertia@, b.inv_mass@, b.inv_inertia@);
+        assert(Rational::from_int_spec(0).lt_spec(meff@));
+        assert(bounds_consistent(row.lo.val(), row.hi.val()));
+    }
+    let lam = solve_row_lambda_exec(&row, &a, &b, &meff);
+    proof {
+        lemma_s4_impulse_closed(
+            row.jla.model@, row.jaa@, row.jlb.model@, row.jab@,
+            a.vel.model@, a.omega@, b.vel.model@, b.omega@,
+            a.inv_mass@, a.inv_inertia@);
+        assert(lam@ == Rational::from_frac_spec(1, 2));
+    }
+    let post_a = apply_impulse_exec(&a, &row.jla, &row.jaa, &lam);
+    let post_b = apply_impulse_exec(&b, &row.jlb, &row.jab, &lam);
+    let row_final = Row { lambda: lam, ..row };
+    let tol_v = RuntimeRational::from_int(0);
+    let tol_p = RuntimeRational::from_int(0);
+    let ok = check_contact_step(&a, &b, &post_a, &post_b, &row_final, &tol_v, &tol_p);
+    let zero = RuntimeRational::from_int(0);
+    let mhalf = RuntimeRational::from_frac(-1, 2);
+    let claim = post_a.vel.x.eq(&mhalf) && post_a.vel.y.eq(&zero)
+        && post_b.vel.x.eq(&mhalf) && post_b.vel.y.eq(&zero)
+        && post_a.omega.eq(&zero) && post_b.omega.eq(&zero);
+    proof {
+        lemma_s4_post_facts(
+            a, b, post_a, post_b,
+            row.jla.model@, row.jaa@, row.jlb.model@, row.jab@, lam@);
+        Rational::lemma_eqv_zero_iff_num_zero(post_a.vel.model@.y);
+        Rational::lemma_eqv_zero_iff_num_zero(post_b.vel.model@.y);
+        Rational::lemma_eqv_zero_iff_num_zero(post_a.omega@);
+        Rational::lemma_eqv_zero_iff_num_zero(post_b.omega@);
+        assert(claim == true);
+        lemma_s4_checks_pass(a, b, post_a, post_b, row_final, lam@);
+        assert(ok == true);
+        assert(contact_step_certified(
+            a, b, post_a, post_b, row_final,
+            Rational::from_int_spec(0), Rational::from_int_spec(0)));
+    }
+    ok && claim
+}
+
+/// Post-impulse velocity models for S4 (structural from λ == 1/2).
+pub proof fn lemma_s4_post_facts(
+    a: Body,
+    b: Body,
+    post_a: Body,
+    post_b: Body,
+    jla: Vec2<Rational>,
+    jaa: Rational,
+    jlb: Vec2<Rational>,
+    jab: Rational,
+    lam: Rational,
+)
+    requires
+        jla == iv2(-1, 0),
+        jlb == iv2(1, 0),
+        jaa == Rational::from_int_spec(0),
+        jab == Rational::from_int_spec(0),
+        lam == Rational::from_frac_spec(1, 2),
+        a.vel.model@ == iv2(0, 0),
+        a.omega@ == Rational::from_int_spec(0),
+        b.vel.model@ == iv2(-1, 0),
+        b.omega@ == Rational::from_int_spec(0),
+        a.inv_mass@ == Rational::from_int_spec(1),
+        a.inv_inertia@ == Rational::from_int_spec(1),
+        b.inv_mass@ == Rational::from_int_spec(1),
+        b.inv_inertia@ == Rational::from_int_spec(1),
+        (post_a.vel.model@, post_a.omega@) == vel_after_impulse(
+            a.inv_mass@, a.inv_inertia@, jla, jaa, lam, a.vel.model@, a.omega@),
+        (post_b.vel.model@, post_b.omega@) == vel_after_impulse(
+            b.inv_mass@, b.inv_inertia@, jlb, jab, lam, b.vel.model@, b.omega@),
+    ensures
+        post_a.vel.model@.x == Rational::from_frac_spec(-1, 2),
+        post_b.vel.model@.x == Rational::from_frac_spec(-1, 2),
+        post_a.vel.model@.y.num == 0,
+        post_b.vel.model@.y.num == 0,
+        post_a.omega@.num == 0,
+        post_b.omega@.num == 0,
+{
+    let one = Rational::from_int_spec(1);
+    let half = Rational::from_frac_spec(1, 2);
+    assert(one.mul_spec(half).num == 1);
+    assert(one.mul_spec(half).den == 1);
+    assert(one.mul_spec(half) == half);
+    // a: vel.x = 0 + (1·½)·(−1) == −½ (structural)
+    assert(post_a.vel.model@.x == Rational::from_frac_spec(-1, 2));
+    assert(post_a.vel.model@.y.num == 0);
+    assert(post_a.omega@.num == 0);
+    // b: vel.x = −1 + (1·½)·1 == −½ (structural)
+    assert(post_b.vel.model@.x == Rational::from_frac_spec(-1, 2));
+    assert(post_b.vel.model@.y.num == 0);
+    assert(post_b.omega@.num == 0);
+}
+
+/// The certificate accepts the S4 step (C1–C4 all check out).
+pub proof fn lemma_s4_checks_pass(
+    a: Body,
+    b: Body,
+    post_a: Body,
+    post_b: Body,
+    row: Row,
+    lam: Rational,
+)
+    requires
+        // body pins
+        a.pos.model@ == iv2(0, 0),
+        b.pos.model@ == iv2(2, 0),
+        a.vel.model@ == iv2(0, 0),
+        a.omega@ == Rational::from_int_spec(0),
+        b.vel.model@ == iv2(-1, 0),
+        b.omega@ == Rational::from_int_spec(0),
+        a.inv_mass@ == Rational::from_int_spec(1),
+        a.inv_inertia@ == Rational::from_int_spec(1),
+        b.inv_mass@ == Rational::from_int_spec(1),
+        b.inv_inertia@ == Rational::from_int_spec(1),
+        a.rot.c@ == Rational::from_int_spec(1),
+        a.rot.s@ == Rational::from_int_spec(0),
+        b.rot.c@ == Rational::from_int_spec(1),
+        b.rot.s@ == Rational::from_int_spec(0),
+        a.shape.model_parts().len() == 1,
+        a.shape.model_parts()[0] == square2(),
+        b.shape.model_parts().len() == 1,
+        b.shape.model_parts()[0] == square2(),
+        // row pins
+        row.jla.model@ == iv2(-1, 0),
+        row.jaa@ == Rational::from_int_spec(0),
+        row.jlb.model@ == iv2(1, 0),
+        row.jab@ == Rational::from_int_spec(0),
+        row.lo.val() == Option::Some(Rational::from_int_spec(0)),
+        row.hi is Inf,
+        row.lambda@ == lam,
+        // impulse pins
+        lam == Rational::from_frac_spec(1, 2),
+        Rational::from_int_spec(0).lt_spec(eff_mass_spec(
+            row.jla.model@, row.jaa@, row.jlb.model@, row.jab@,
+            a.inv_mass@, a.inv_inertia@, b.inv_mass@, b.inv_inertia@)),
+        lam == clamp_spec(
+            Rational::from_int_spec(0).sub_spec(
+                row_vel_spec(
+                    row.jla.model@, row.jaa@, row.jlb.model@, row.jab@,
+                    a.vel.model@, a.omega@, b.vel.model@, b.omega@)
+                    .add_spec(Rational::from_int_spec(0)).div_spec(eff_mass_spec(
+                        row.jla.model@, row.jaa@, row.jlb.model@, row.jab@,
+                        a.inv_mass@, a.inv_inertia@, b.inv_mass@, b.inv_inertia@))),
+            Option::Some(Rational::from_int_spec(0)),
+            Option::None),
+        // post pins
+        (post_a.vel.model@, post_a.omega@) == vel_after_impulse(
+            a.inv_mass@, a.inv_inertia@, row.jla.model@, row.jaa@, lam,
+            a.vel.model@, a.omega@),
+        (post_b.vel.model@, post_b.omega@) == vel_after_impulse(
+            b.inv_mass@, b.inv_inertia@, row.jlb.model@, row.jab@, lam,
+            b.vel.model@, b.omega@),
+        post_a.pos.model@ == a.pos.model@,
+        post_b.pos.model@ == b.pos.model@,
+        post_a.rot.c@ == a.rot.c@,
+        post_a.rot.s@ == a.rot.s@,
+        post_b.rot.c@ == b.rot.c@,
+        post_b.rot.s@ == b.rot.s@,
+        post_a.shape.model_parts() == a.shape.model_parts(),
+        post_b.shape.model_parts() == b.shape.model_parts(),
+    ensures
+        contact_checks_pass(
+            a, b, post_a, post_b, row,
+            Rational::from_int_spec(0), Rational::from_int_spec(0)),
+{
+    let z = Rational::from_int_spec(0);
+    // C1: post models == the impulse forms structurally ⟹ eqv
+    Rational::lemma_eqv_reflexive(post_a.vel.model@.x);
+    Rational::lemma_eqv_reflexive(post_a.vel.model@.y);
+    Rational::lemma_eqv_reflexive(post_a.omega@);
+    Rational::lemma_eqv_reflexive(post_b.vel.model@.x);
+    Rational::lemma_eqv_reflexive(post_b.vel.model@.y);
+    Rational::lemma_eqv_reflexive(post_b.omega@);
+    Rational::lemma_eqv_reflexive(post_a.pos.model@.x);
+    Rational::lemma_eqv_reflexive(post_a.pos.model@.y);
+    Rational::lemma_eqv_reflexive(post_b.pos.model@.x);
+    Rational::lemma_eqv_reflexive(post_b.pos.model@.y);
+    // C2: 0 ≤ 1/2 (closed)
+    Rational::lemma_from_int_preserves_le(0, 1);
+    assert(z.le_spec(lam)) by {
+        assert(lam.num == 1);
+        assert(lam.denom() == 2);
+        assert(z.num == 0);
+        assert(z.denom() == 1);
+    };
+    // C3 via the abstract fresh-row lemma
+    lemma_solve_row_c3(
+        row.jla.model@, row.jaa@, row.jlb.model@, row.jab@,
+        a.inv_mass@, a.inv_inertia@, b.inv_mass@, b.inv_inertia@,
+        a.vel.model@, a.omega@, b.vel.model@, b.omega@, lam);
+    // C4: world polys are the literals; facts from the closed helpers
+    lemma_square2_convex();
+    lemma_square2b_convex();
+    lemma_s4_world_verts();
+    lemma_s4_c4_facts();
+    assert(body_world_verts(post_a) == square2());
+    assert(body_world_verts(post_b) == square2b());
+    assert(convex_poly_inv(body_world_verts(post_a)));
+    assert(convex_poly_inv(body_world_verts(post_b)));
+    assert(c4_touch_witness(square2(), square2b(), z, true, 1));
+    assert(contact_checks_pass(a, b, post_a, post_b, row, z, z));
 }
 
 } // verus!

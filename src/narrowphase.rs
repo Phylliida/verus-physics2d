@@ -18,6 +18,7 @@ use crate::proofs::shape::{
     lemma_axis_sep_eq_neg_orient, lemma_min_pos_all, lemma_min_sep_attained,
     lemma_min_sep_le_all,
 };
+use crate::massprops::vdot;
 use crate::shape::{axis_sep, edge_normal, min_sep, orient, ConvexPoly};
 use crate::types::{SVec2, Scalar};
 
@@ -198,6 +199,114 @@ pub fn min_axis_sep_exec(n: &SVec2, p: &SVec2, other: &ConvexPoly) -> (out: (Sca
             best@, min_sep(n.model@, p.model@, other.model_verts(), 0));
     }
     (best, best_i)
+}
+
+/// vdot with exact model.
+pub fn dot_exec(a: &SVec2, b: &SVec2) -> (out: Scalar)
+    requires
+        a.wf_spec(),
+        b.wf_spec(),
+    ensures
+        out.wf_spec(),
+        out@ == vdot(a.model@, b.model@),
+{
+    let t1 = a.x.mul(&b.x);
+    let t2 = a.y.mul(&b.y);
+    t1.add(&t2)
+}
+
+/// Dot of the reference normal with incident edge e's outward normal.
+pub open spec fn inc_normal_dot(
+    ref_n: Vec2<Rational>,
+    inc: Seq<Vec2<Rational>>,
+    e: int,
+) -> Rational
+    recommends 0 <= e < inc.len()
+{
+    vdot(ref_n, edge_normal(inc[e], inc[(e + 1) % (inc.len() as int)]))
+}
+
+/// Incident edge selection (SPEC §5 step 3): the edge of `inc` whose
+/// outward normal has minimal dot with the reference normal (ties: lower
+/// index). Ensures the returned index attains the min.
+pub fn incident_edge_exec(ref_n: &SVec2, inc: &ConvexPoly) -> (out: usize)
+    requires
+        ref_n.wf_spec(),
+        inc.wf_spec(),
+    ensures
+        out < inc.verts@.len(),
+        forall|e: int|
+            0 <= e < inc.verts@.len() ==> inc_normal_dot(
+                ref_n.model@, inc.model_verts(), out as int).le_spec(
+                #[trigger] inc_normal_dot(ref_n.model@, inc.model_verts(), e)),
+{
+    let n0 = edge_normal_exec(&inc.verts[0], &inc.verts[1 % inc.verts.len()]);
+    let mut best = dot_exec(ref_n, &n0);
+    let mut best_e: usize = 0;
+    proof {
+        assert(inc.verts@.len() >= 3);
+        assert(inc.model_verts()[0] == inc.verts@[0].model@);
+        assert(inc.model_verts()[(0 as int + 1) % (inc.model_verts().len() as int)]
+            == inc.verts@[(1usize % inc.verts.len()) as int].model@);
+        assert(best@ == inc_normal_dot(ref_n.model@, inc.model_verts(), 0));
+    }
+    let mut e: usize = 1;
+    while e < inc.verts.len()
+        invariant
+            ref_n.wf_spec(),
+            inc.wf_spec(),
+            1 <= e <= inc.verts@.len(),
+            best_e < e,
+            best.wf_spec(),
+            best@ == inc_normal_dot(ref_n.model@, inc.model_verts(), best_e as int),
+            forall|k: int|
+                0 <= k < e as int ==> best@.le_spec(
+                    #[trigger] inc_normal_dot(ref_n.model@, inc.model_verts(), k)),
+        decreases inc.verts.len() - e,
+    {
+        let va = &inc.verts[e];
+        let vb = &inc.verts[(e + 1) % inc.verts.len()];
+        let en = edge_normal_exec(va, vb);
+        let d = dot_exec(ref_n, &en);
+        let ghost prev = best@;
+        let is_less = d.lt(&best);
+        if is_less {
+            best = d;
+            best_e = e;
+        }
+        proof {
+            assert(va.model@ == inc.model_verts()[e as int]);
+            assert(vb.model@ == inc.model_verts()[
+                (e as int + 1) % (inc.model_verts().len() as int)]);
+            assert(d@ == inc_normal_dot(ref_n.model@, inc.model_verts(), e as int));
+            if is_less {
+                assert(best@ == d@);
+                assert(best@ == inc_normal_dot(ref_n.model@, inc.model_verts(), e as int));
+                assert(d@.lt_spec(prev));
+                Rational::lemma_lt_implies_le(d@, prev);
+                assert forall|k: int|
+                    0 <= k < e as int + 1 implies best@.le_spec(
+                        #[trigger] inc_normal_dot(ref_n.model@, inc.model_verts(), k))
+                by {
+                    if k == e as int {
+                        Rational::lemma_eqv_implies_le(best@, best@);
+                    } else {
+                        Rational::lemma_le_transitive(
+                            best@, prev,
+                            inc_normal_dot(ref_n.model@, inc.model_verts(), k));
+                    }
+                }
+            } else {
+                assert(best@ == prev);
+                assert(!d@.lt_spec(prev));
+                Rational::lemma_trichotomy(prev, d@);
+                assert(prev.le_spec(d@));
+                assert(prev.le_spec(inc_normal_dot(ref_n.model@, inc.model_verts(), e as int)));
+            }
+        }
+        e = e + 1;
+    }
+    best_e
 }
 
 /// One-sided pass over owner's edges. Returns the separating edge if any,

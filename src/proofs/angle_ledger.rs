@@ -524,7 +524,7 @@ pub proof fn lemma_two_mul_monotone(a: Rational, b: Rational)
 }
 
 /// The enclosure is always ordered: lo ≤ hi.
-pub proof fn lemma_angle_enclosure_ordered(t: Rational, k: nat)
+pub(crate) proof fn lemma_angle_enclosure_ordered(t: Rational, k: nat)
     requires
         t_in_unit_interval(t),
     ensures
@@ -545,7 +545,7 @@ pub proof fn lemma_angle_enclosure_ordered(t: Rational, k: nat)
 }
 
 /// Enclosures nest: enclosure_{k+2} ⊆ enclosure_k (monotone shrink, SPEC §3).
-pub proof fn lemma_angle_enclosure_shrink(t: Rational, k: nat)
+pub(crate) proof fn lemma_angle_enclosure_shrink(t: Rational, k: nat)
     requires
         t_in_unit_interval(t),
     ensures
@@ -678,7 +678,7 @@ pub proof fn lemma_two_x_neg(x: Rational)
 }
 
 /// The enclosure endpoints negate with t (structural, both parities).
-pub proof fn lemma_angle_enclosure_neg(t: Rational, k: nat)
+pub(crate) proof fn lemma_angle_enclosure_neg(t: Rational, k: nat)
     ensures
         angle_enclosure(t.neg_spec(), k).0 == angle_enclosure(t, k).0.neg_spec(),
         angle_enclosure(t.neg_spec(), k).1 == angle_enclosure(t, k).1.neg_spec(),
@@ -706,7 +706,7 @@ pub proof fn lemma_angle_enclosure_neg(t: Rational, k: nat)
 
 /// Signed ordering (the v1.4 debt): −1 ≤ t ≤ 0 ⇒ enc(t,k).1 ≤ enc(t,k).0.
 /// Mirror of lemma_angle_enclosure_ordered via negation of the endpoints.
-pub proof fn lemma_angle_enclosure_ordered_negative(t: Rational, k: nat)
+pub(crate) proof fn lemma_angle_enclosure_ordered_negative(t: Rational, k: nat)
     requires
         t_in_unit_interval(t.neg_spec()),
     ensures

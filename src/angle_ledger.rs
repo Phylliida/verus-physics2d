@@ -46,6 +46,13 @@ pub open spec fn two_x(x: Rational) -> Rational {
 /// The applied-angle enclosure at index k: [lo, hi] for 2·arctan(t),
 /// ordered by the parity of k (even sums dominate odd sums for 0 ≤ t ≤ 1;
 /// see proofs/angle_ledger.rs).
+///
+/// INTERNAL API (A9(g)): the standard entry point is
+/// `angle_enclosure_signed`, which orders lo ≤ hi on the full symmetric
+/// range [−1, 1]; this parity-ordered form remains only as the shared
+/// unfolding target of the ledger lemmas. (It must stay `pub` because the
+/// signed wrapper is an open spec fn — Verus treats open bodies as part
+/// of the public interface.)
 pub open spec fn angle_enclosure(t: Rational, k: nat) -> (Rational, Rational) {
     if k % 2 == 0 {
         (two_x(arctan_sum(t, k + 1)), two_x(arctan_sum(t, k)))
@@ -165,18 +172,19 @@ pub fn arctan_sum_exec(t: &Scalar, k: usize) -> (out: Scalar)
     out
 }
 
-/// Exact evaluator for angle_enclosure(t@, k), with the lo ≤ hi guarantee
-/// (requires t ∈ [0, 1] — the phase-1 restriction of SPEC §3).
+/// Exact evaluator for angle_enclosure_signed(t@, k) — the standard
+/// enclosure API (A9(g)) — with the lo ≤ hi guarantee on the full
+/// symmetric phase-1 range t ∈ [−1, 1] (SPEC §3).
 pub fn angle_enclosure_exec(t: &Scalar, k: usize) -> (out: (Scalar, Scalar))
     requires
         t.wf_spec(),
-        t_in_unit_interval(t@),
+        t_in_symmetric_unit_interval(t@),
         k < 1_000_000,
     ensures
         out.0.wf_spec(),
         out.1.wf_spec(),
-        out.0@ == angle_enclosure(t@, k as nat).0,
-        out.1@ == angle_enclosure(t@, k as nat).1,
+        out.0@ == angle_enclosure_signed(t@, k as nat).0,
+        out.1@ == angle_enclosure_signed(t@, k as nat).1,
         out.0@.le_spec(out.1@),
 {
     let ak = arctan_sum_exec(t, k);
@@ -184,13 +192,32 @@ pub fn angle_enclosure_exec(t: &Scalar, k: usize) -> (out: (Scalar, Scalar))
     let two = RuntimeRational::from_int(2);
     let ak2 = two.mul(&ak);
     let ak12 = two.mul(&ak1);
+    let zero = RuntimeRational::from_int(0);
+    let nonneg = zero.le(&t);
     proof {
-        crate::proofs::angle_ledger::lemma_angle_enclosure_ordered(t@, k as nat);
+        crate::proofs::angle_ledger::lemma_angle_enclosure_signed_ordered(t@, k as nat);
     }
-    if k % 2 == 0 {
-        (ak12, ak2)
+    if nonneg {
+        proof {
+            // 0 ≤ t: the signed enclosure IS the parity-ordered one.
+            assert(angle_enclosure_signed(t@, k as nat) == angle_enclosure(t@, k as nat));
+        }
+        if k % 2 == 0 {
+            (ak12, ak2)
+        } else {
+            (ak2, ak12)
+        }
     } else {
-        (ak2, ak12)
+        proof {
+            // t < 0: the signed enclosure swaps the parity-ordered endpoints.
+            assert(angle_enclosure_signed(t@, k as nat).0 == angle_enclosure(t@, k as nat).1);
+            assert(angle_enclosure_signed(t@, k as nat).1 == angle_enclosure(t@, k as nat).0);
+        }
+        if k % 2 == 0 {
+            (ak2, ak12)
+        } else {
+            (ak12, ak2)
+        }
     }
 }
 

@@ -29,4 +29,7 @@ pub mod cert;
 pub mod row;
 
 #[cfg(verus_keep_ghost)]
+pub mod manifold;
+
+#[cfg(verus_keep_ghost)]
 pub mod world;

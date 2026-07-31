@@ -10,6 +10,7 @@
 
 use vstd::prelude::*;
 
+use verus_algebra::traits::*;
 use verus_linalg::runtime::vec2::RuntimeVec2;
 use verus_linalg::vec2::Vec2;
 use verus_rational::{Rational, RuntimeRational};
@@ -19,8 +20,9 @@ use crate::proofs::shape::{
     lemma_min_sep_le_all,
 };
 use crate::massprops::vdot;
-use crate::shape::{axis_sep, edge_normal, min_sep, orient, ConvexPoly};
-use crate::types::{SVec2, Scalar};
+use crate::massprops::vscale;
+use crate::shape::{axis_sep, edge_normal, min_sep, orient, vadd, vsub, ConvexPoly};
+use crate::types::{copy_svec2, SVec2, Scalar};
 
 verus! {
 
@@ -224,6 +226,20 @@ pub open spec fn inc_normal_dot(
     recommends 0 <= e < inc.len()
 {
     vdot(ref_n, edge_normal(inc[e], inc[(e + 1) % (inc.len() as int)]))
+}
+
+/// q ≡ a + u·(b − a) component-wise with 0 ≤ u ≤ 1: q interpolates the
+/// segment a–b (the clipping span witness, SPEC §5 step 3).
+pub open spec fn interp_rel(
+    a: Vec2<Rational>,
+    b: Vec2<Rational>,
+    q: Vec2<Rational>,
+    u: Rational,
+) -> bool {
+    &&& Rational::from_int_spec(0).le_spec(u)
+    &&& u.le_spec(Rational::from_int_spec(1))
+    &&& q.x.eqv_spec(vadd(a, vscale(u, vsub(b, a))).x)
+    &&& q.y.eqv_spec(vadd(a, vscale(u, vsub(b, a))).y)
 }
 
 /// Incident edge selection (SPEC §5 step 3): the edge of `inc` whose
@@ -563,6 +579,223 @@ pub fn sat_classify(a: &ConvexPoly, b: &ConvexPoly) -> (out: SatResult)
     } else {
         SatResult::Touching { from_a: false, edge: max_b }
     }
+}
+
+/// The plane intersection point of segment q0–q1 (exactly one endpoint
+/// inside the half-plane {q : dot(d, q − base) ≥ 0}). Exact rational
+/// interpolation, no sqrt. Ensures: the point lies exactly on the clip
+/// plane and interpolates the segment (SPEC §5 step 3).
+pub fn clip_intersection_exec(
+    d: &SVec2,
+    base: &SVec2,
+    q0: &SVec2,
+    q1: &SVec2,
+    keep0: bool,
+) -> (out: SVec2)
+    requires
+        d.wf_spec(),
+        base.wf_spec(),
+        q0.wf_spec(),
+        q1.wf_spec(),
+        keep0 ==> {
+            &&& Rational::from_int_spec(0).le_spec(axis_sep(d.model@, base.model@, q0.model@))
+            &&& axis_sep(d.model@, base.model@, q1.model@).lt_spec(Rational::from_int_spec(0))
+        },
+        !keep0 ==> {
+            &&& axis_sep(d.model@, base.model@, q0.model@).lt_spec(Rational::from_int_spec(0))
+            &&& Rational::from_int_spec(0).le_spec(axis_sep(d.model@, base.model@, q1.model@))
+        },
+    ensures
+        out.wf_spec(),
+        axis_sep(d.model@, base.model@, out.model@).eqv_spec(Rational::from_int_spec(0)),
+        exists|u: Rational| interp_rel(q0.model@, q1.model@, out.model@, u),
+{
+    let v0 = axis_sep_exec(d, base, q0);
+    let v1 = axis_sep_exec(d, base, q1);
+    if keep0 {
+        let den = v0.sub(&v1);
+        proof {
+            crate::proofs::manifold::lemma_clip_t_bounds(v0@, v1@);
+        }
+        let t = v0.div(&den);
+        let dq = q1.sub(q0);
+        let tdq = dq.scaled(&t);
+        let q = q0.add(&tdq);
+        proof {
+            assert(q.model@ == q0.model@.add(tdq.model@));
+            assert(q.model@.x == q0.model@.x.add_spec(tdq.model@.x).canonical());
+            assert(q.model@.y == q0.model@.y.add_spec(tdq.model@.y).canonical());
+            assert(tdq.model@.x == t@.mul_spec(dq.model@.x).canonical());
+            assert(tdq.model@.y == t@.mul_spec(dq.model@.y).canonical());
+            assert(dq.model@.x == q1.model@.x.sub_spec(q0.model@.x).canonical());
+            assert(dq.model@.y == q1.model@.y.sub_spec(q0.model@.y).canonical());
+            assert(q.model@.x == q0.model@.x.add_spec(
+                t@.mul_spec(q1.model@.x.sub_spec(q0.model@.x).canonical()).canonical()).canonical());
+            assert(q.model@.y == q0.model@.y.add_spec(
+                t@.mul_spec(q1.model@.y.sub_spec(q0.model@.y).canonical()).canonical()).canonical());
+            assert(t@ == v0@.div_spec(v0@.sub_spec(v1@)));
+            crate::proofs::manifold::lemma_clip_point_facts(
+                d.model@, base.model@, q0.model@, q1.model@, q.model@, t@);
+            assert(exists|u: Rational| interp_rel(q0.model@, q1.model@, q.model@, u));
+        }
+        q
+    } else {
+        let den = v1.sub(&v0);
+        proof {
+            crate::proofs::manifold::lemma_clip_t_bounds(v1@, v0@);
+        }
+        let t1 = v1.div(&den);
+        let dq = q0.sub(q1);
+        let tdq = dq.scaled(&t1);
+        let q = q1.add(&tdq);
+        proof {
+            assert(q.model@ == q1.model@.add(tdq.model@));
+            assert(q.model@.x == q1.model@.x.add_spec(tdq.model@.x).canonical());
+            assert(q.model@.y == q1.model@.y.add_spec(tdq.model@.y).canonical());
+            assert(tdq.model@.x == t1@.mul_spec(dq.model@.x).canonical());
+            assert(tdq.model@.y == t1@.mul_spec(dq.model@.y).canonical());
+            assert(dq.model@.x == q0.model@.x.sub_spec(q1.model@.x).canonical());
+            assert(dq.model@.y == q0.model@.y.sub_spec(q1.model@.y).canonical());
+            assert(q.model@.x == q1.model@.x.add_spec(
+                t1@.mul_spec(q0.model@.x.sub_spec(q1.model@.x).canonical()).canonical()).canonical());
+            assert(q.model@.y == q1.model@.y.add_spec(
+                t1@.mul_spec(q0.model@.y.sub_spec(q1.model@.y).canonical()).canonical()).canonical());
+            assert(t1@ == v1@.div_spec(v1@.sub_spec(v0@)));
+            crate::proofs::manifold::lemma_clip_point_facts_swapped(
+                d.model@, base.model@, q0.model@, q1.model@, q.model@, t1@);
+            assert(exists|u: Rational| interp_rel(q0.model@, q1.model@, q.model@, u));
+        }
+        q
+    }
+}
+
+/// Clip the segment q0–q1 against the half-plane {q : dot(d, q − base) ≥ 0}
+/// (one side plane of the reference edge, SPEC §5 step 3). Output: 0–2
+/// points in segment order, each inside the half-plane and interpolating
+/// the input segment.
+pub fn clip_halfplane_exec(
+    d: &SVec2,
+    base: &SVec2,
+    q0: &SVec2,
+    q1: &SVec2,
+) -> (out: Vec<SVec2>)
+    requires
+        d.wf_spec(),
+        base.wf_spec(),
+        q0.wf_spec(),
+        q1.wf_spec(),
+    ensures
+        out@.len() <= 2,
+        forall|k: int|
+            0 <= k < out@.len() ==> {
+                let q = (#[trigger] out@[k]);
+                &&& q.wf_spec()
+                &&& Rational::from_int_spec(0).le_spec(
+                        axis_sep(d.model@, base.model@, q.model@))
+                &&& exists|u: Rational|
+                        interp_rel(q0.model@, q1.model@, q.model@, u)
+            },
+{
+    let v0 = axis_sep_exec(d, base, q0);
+    let v1 = axis_sep_exec(d, base, q1);
+    let zero = RuntimeRational::from_int(0);
+    let keep0 = zero.le(&v0);
+    let keep1 = zero.le(&v1);
+    let mut out: Vec<SVec2> = Vec::new();
+    if keep0 && keep1 {
+        proof {
+            assert(zero@.le_spec(v0@));
+            assert(zero@.le_spec(v1@));
+        }
+        out.push(copy_svec2(q0));
+        out.push(copy_svec2(q1));
+        proof {
+            assert forall|k: int|
+                0 <= k < out@.len() implies {
+                    let q = (#[trigger] out@[k]);
+                    &&& q.wf_spec()
+                    &&& Rational::from_int_spec(0).le_spec(
+                            axis_sep(d.model@, base.model@, q.model@))
+                    &&& exists|u: Rational|
+                            interp_rel(q0.model@, q1.model@, q.model@, u)
+                }
+            by {
+                crate::proofs::manifold::lemma_interp_rel_endpoints(q0.model@, q1.model@);
+                if k == 0 {
+                    assert(out@[k].model@ == q0.model@);
+                } else {
+                    assert(out@[k].model@ == q1.model@);
+                }
+            }
+        }
+    } else if keep0 {
+        proof {
+            assert(zero@.le_spec(v0@));
+            assert(!zero@.le_spec(v1@));
+            Rational::lemma_trichotomy(zero@, v1@);
+        }
+        let qi = clip_intersection_exec(d, base, q0, q1, true);
+        out.push(copy_svec2(q0));
+        out.push(qi);
+        proof {
+            assert forall|k: int|
+                0 <= k < out@.len() implies {
+                    let q = (#[trigger] out@[k]);
+                    &&& q.wf_spec()
+                    &&& Rational::from_int_spec(0).le_spec(
+                            axis_sep(d.model@, base.model@, q.model@))
+                    &&& exists|u: Rational|
+                            interp_rel(q0.model@, q1.model@, q.model@, u)
+                }
+            by {
+                if k == 0 {
+                    assert(out@[k].model@ == q0.model@);
+                    crate::proofs::manifold::lemma_interp_rel_endpoints(
+                        q0.model@, q1.model@);
+                } else {
+                    Rational::lemma_eqv_implies_le(
+                        axis_sep(d.model@, base.model@, out@[k].model@),
+                        Rational::from_int_spec(0));
+                }
+            }
+        }
+    } else if keep1 {
+        proof {
+            assert(!zero@.le_spec(v0@));
+            assert(zero@.le_spec(v1@));
+            Rational::lemma_trichotomy(zero@, v0@);
+        }
+        let qi = clip_intersection_exec(d, base, q0, q1, false);
+        out.push(qi);
+        out.push(copy_svec2(q1));
+        proof {
+            assert forall|k: int|
+                0 <= k < out@.len() implies {
+                    let q = (#[trigger] out@[k]);
+                    &&& q.wf_spec()
+                    &&& Rational::from_int_spec(0).le_spec(
+                            axis_sep(d.model@, base.model@, q.model@))
+                    &&& exists|u: Rational|
+                            interp_rel(q0.model@, q1.model@, q.model@, u)
+                }
+            by {
+                if k == 1 {
+                    assert(out@[k].model@ == q1.model@);
+                    crate::proofs::manifold::lemma_interp_rel_endpoints(
+                        q0.model@, q1.model@);
+                } else {
+                    Rational::lemma_eqv_implies_le(
+                        axis_sep(d.model@, base.model@, out@[k].model@),
+                        Rational::from_int_spec(0));
+                }
+            }
+        }
+    } else {
+        proof {
+            assert(out@.len() == 0);
+        }
+    }
+    out
 }
 
 } // verus!

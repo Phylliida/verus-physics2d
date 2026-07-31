@@ -1,6 +1,7 @@
 //! Single-contact step certificate (phys-05d; SPEC §7 subset: one contact
 //! row, no gravity, no snaps, no position integration, single-part shapes).
-//! The full multi-row StepCert with ledgers and joints is phys-06.
+//! The full multi-row checker (C1–C7) is phys-06; the StepCert/SnapEntry
+//! datatypes (SPEC §7) already live here.
 //!
 //! D8: the engine's claims rest on this checker, not on the solver — it
 //! re-computes the impulse application (C1), the λ bounds (C2), the post
@@ -27,6 +28,37 @@ use crate::shape::{convex_poly_inv, edge_normal, min_sep, ConvexPoly};
 use crate::types::{SVec2, Scalar};
 
 verus! {
+
+/// Which field a snap entry applies to (SPEC §7, D3/E5).
+pub enum SnapKind {
+    VelX,
+    VelY,
+    Omega,
+    PosX,
+    PosY,
+}
+
+/// One declared snap: the value-changing rounding of a single component
+/// (SPEC §7). The checker (C6a) recomputes the actual signed delta from
+/// pre/post fields and requires |actual| ≤ bound.
+pub struct SnapEntry {
+    pub body: usize,
+    pub kind: SnapKind,
+    /// The actual signed delta applied.
+    pub delta: Scalar,
+    /// The declared bound: |delta| ≤ bound.
+    pub bound: Scalar,
+}
+
+/// The full step certificate (SPEC §7): the untrusted witness the checker
+/// re-verifies. rows carries the final λ per row; tan_halfs and
+/// angle_entries are per body; snaps is vacuous until 06c.
+pub struct StepCert {
+    pub rows: Vec<Row>,
+    pub tan_halfs: Vec<Scalar>,
+    pub snaps: Vec<SnapEntry>,
+    pub angle_entries: Vec<Scalar>,
+}
 
 /// C1 (single row, impulse-only): post velocities/omegas are the
 /// impulse-applied pre values and positions are unchanged (eqv per

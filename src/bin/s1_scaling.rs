@@ -54,7 +54,7 @@ fn run_steps(n: usize) -> f64 {
     let t0 = Instant::now();
     for _ in 0..n {
         match step_free_flight(&w) {
-            StepResult::Ok(w2, _ts) => w = w2,
+            StepResult::Ok(w2, _cert) => w = w2,
             StepResult::Reject(_) => panic!("unexpected reject"),
         }
     }
@@ -78,7 +78,7 @@ fn main() {
     for i in 0..15 {
         let t0 = Instant::now();
         match step_free_flight(&w) {
-            StepResult::Ok(w2, _ts) => w = w2,
+            StepResult::Ok(w2, _cert) => w = w2,
             StepResult::Reject(_) => panic!("unexpected reject"),
         }
         let step_ms = t0.elapsed().as_secs_f64() * 1000.0;

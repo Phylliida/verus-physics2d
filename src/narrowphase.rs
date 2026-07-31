@@ -28,6 +28,25 @@ pub enum SatResult {
     Touching { from_a: bool, edge: usize },
 }
 
+/// A single contact point on the reference face (SPEC §5 step 3).
+/// sep ≤ 0 relative to the reference face (exact axis_sep value).
+pub struct ContactPoint {
+    pub point: SVec2,
+    pub sep: Scalar,
+}
+
+/// Contact manifold for a touching pair (SPEC §5 step 3, phys-06).
+/// The normal is UNNORMALIZED (never sqrt) and points A → B; points are
+/// lex-sorted (E6 canonical order), 1 or 2 of them.
+pub struct ContactManifold {
+    pub a: usize,
+    pub b: usize,
+    pub normal: SVec2,
+    pub points: Vec<ContactPoint>,
+    /// (reference edge, incident edge).
+    pub feature: (usize, usize),
+}
+
 /// The separating witness, spec-side: the axis from `owner`'s edge
 /// strictly separates owner's vertices (inner side, ≤ 0) from other's
 /// (strictly outward, > 0).

@@ -189,8 +189,8 @@ pub fn scene_s1() -> (out: bool)
         proof {
             assert(r is Ok);
         }
-        let (w2, ts) = match r {
-            StepResult::Ok(w2, ts) => (w2, ts),
+        let (w2, cert) = match r {
+            StepResult::Ok(w2, cert) => (w2, cert),
             StepResult::Reject(_) => {
                 proof {
                     assert(false);
@@ -199,7 +199,7 @@ pub fn scene_s1() -> (out: bool)
             },
         };
         proof {
-            lemma_step_preserves_momentum(w, w2, ts@);
+            lemma_step_preserves_momentum(w, w2, cert.tan_halfs@);
             Rational::lemma_eqv_transitive(
                 lin_mom_x(w2.bodies@, 2 as nat),
                 lin_mom_x(w.bodies@, 2 as nat),
@@ -215,7 +215,7 @@ pub fn scene_s1() -> (out: bool)
             assert forall|j: int|
                 0 <= j < 2 implies (#[trigger] w2.bodies@[j]).omega@ == Rational::from_int_spec(0)
             by {
-                let tj = ts@[j];
+                let tj = cert.tan_halfs@[j];
             }
         }
         w = w2;
@@ -316,8 +316,8 @@ pub fn scene_s2() -> (out: bool)
         proof {
             assert(r is Ok);
         }
-        let (w2, ts) = match r {
-            StepResult::Ok(w2, ts) => (w2, ts),
+        let (w2, cert) = match r {
+            StepResult::Ok(w2, cert) => (w2, cert),
             StepResult::Reject(_) => {
                 proof {
                     assert(false);
@@ -326,7 +326,7 @@ pub fn scene_s2() -> (out: bool)
             },
         };
         proof {
-            let ghost t0 = ts@[0]@;
+            let ghost t0 = cert.tan_halfs@[0]@;
             let ghost inc = ledger_increment(t0, 8 as nat);
             let ghost cap = Rational::from_frac_spec(2, 19);
             // inc = 2·|term_9(t0)| ≤ 2·(1/19) == cap (signed uniform bound)
@@ -472,8 +472,8 @@ pub fn scene_s2_neg() -> (out: bool)
         proof {
             assert(r is Ok);
         }
-        let (w2, ts) = match r {
-            StepResult::Ok(w2, ts) => (w2, ts),
+        let (w2, cert) = match r {
+            StepResult::Ok(w2, cert) => (w2, cert),
             StepResult::Reject(_) => {
                 proof {
                     assert(false);
@@ -482,7 +482,7 @@ pub fn scene_s2_neg() -> (out: bool)
             },
         };
         proof {
-            let ghost t0 = ts@[0]@;
+            let ghost t0 = cert.tan_halfs@[0]@;
             let ghost inc = ledger_increment(t0, 8 as nat);
             let ghost cap = Rational::from_frac_spec(2, 19);
             // inc = 2·|term_9(t0)| ≤ 2·(1/19) == cap (signed uniform bound)

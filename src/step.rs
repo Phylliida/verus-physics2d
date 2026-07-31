@@ -2,8 +2,9 @@
 //!
 //! Pure: World -> StepResult, Reject = tan-half parameter outside [−1,1]
 //! (driver policy is to halve dt, SPEC §1/§3). StepResult replaces the
-//! old Option form (DESIGN §3.7(a)); Ok carries the per-body tan-half
-//! parameters (the future StepCert's tan_halfs, SPEC §7).
+//! old Option form (DESIGN §3.7(a)); Ok carries the StepCert witness
+//! (SPEC §7 — rows/snaps empty for free flight, tan_halfs and
+//! angle_entries per body).
 //! Rotation integrates through the untrusted tan_half_series chooser; the
 //! per-body ledger accumulates 2·|term_{k+1}(t)| (E2 angle ledger, phys-02b).
 
@@ -18,6 +19,7 @@ use crate::angle_ledger::{
     arctan_term, arctan_term_exec, t_in_symmetric_unit_interval, t_in_unit_interval, two_x,
 };
 use crate::body::Body;
+use crate::certificate::StepCert;
 use crate::joints::Joint;
 use crate::proofs::rational_raw::{
     compose_c, compose_s, lemma_raw_add_nonneg, lemma_raw_add_zero_right, lemma_raw_abs_nonneg,
@@ -351,14 +353,20 @@ pub proof fn lemma_ledger_increment_zero(t: Rational, series_k: nat)
 pub enum RejectReason {
     /// A body's tan-half series parameter escaped [−1, 1] (SPEC §3).
     AngleOutOfRange(usize),
+    /// The certificate checker rejected the step (D8: never wrong-accept).
+    CertFailed,
+    /// A snap/canonicalize failed a denominator bound (SPEC §7, 06c).
+    DenomOverflow,
+    /// Degenerate contact (zero-length normal etc., SPEC §5).
+    ManifoldFailed,
 }
 
 /// The step contract (SPEC §1, DESIGN §3.7(a)): Ok carries the post-step
-/// world and the per-body tan-half parameters used (the future StepCert's
-/// tan_halfs, SPEC §7); Reject carries the reason. Rollback is free
-/// because step is pure (E3).
+/// world and the StepCert witness (SPEC §7) — rows and snaps are empty
+/// for free flight; Reject carries the reason. Rollback is free because
+/// step is pure (E3).
 pub enum StepResult {
-    Ok(World, Vec<Scalar>),
+    Ok(World, StepCert),
     Reject(RejectReason),
 }
 
@@ -379,28 +387,34 @@ pub fn step_free_flight(w: &World) -> (out: StepResult)
             ==> out is Ok,
         out is Ok ==> {
             let w2 = out->Ok_0;
-            let ts = out->Ok_1;
+            let cert = out->Ok_1;
             &&& w2.wf_spec()
             &&& w2.bodies@.len() == w.bodies@.len()
-            &&& ts@.len() == w.bodies@.len()
+            &&& cert.tan_halfs@.len() == w.bodies@.len()
+            &&& cert.rows@.len() == 0
+            &&& cert.snaps@.len() == 0
+            &&& cert.angle_entries@.len() == w.bodies@.len()
             &&& w2.gravity.model@ == w.gravity.model@
             &&& w2.dt@ == w.dt@
             &&& w2.series_k == w.series_k
             &&& forall|i: int|
                 0 <= i < w.bodies@.len() ==> {
-                    let ti = #[trigger] ts@[i];
+                    let ti = #[trigger] cert.tan_halfs@[i];
                     &&& ti.wf_spec()
                     &&& t_in_symmetric_unit_interval(ti@)
                     &&& body_step_rel(
                         w.bodies@[i], w2.bodies@[i], w.gravity.model@, w.dt@, ti@)
                     &&& w2.angle_err@[i]@.eqv_spec(
                         w.angle_err@[i as int]@.add_spec(ledger_increment(ti@, w.series_k as nat)))
+                    &&& cert.angle_entries@[i]@.eqv_spec(
+                        ledger_increment(ti@, w.series_k as nat))
                 }
         },
 {
     let mut new_bodies: Vec<Body> = Vec::new();
     let mut new_errs: Vec<Scalar> = Vec::new();
     let mut ts: Vec<Scalar> = Vec::new();
+    let mut angle_entries: Vec<Scalar> = Vec::new();
     let mut i: usize = 0;
     while i < w.bodies.len()
         invariant
@@ -409,6 +423,7 @@ pub fn step_free_flight(w: &World) -> (out: StepResult)
             new_bodies@.len() == i as int,
             new_errs@.len() == i as int,
             ts@.len() == i as int,
+            angle_entries@.len() == i as int,
             forall|j: int|
                 0 <= j < i as int ==> {
                     let tj = #[trigger] ts@[j];
@@ -421,6 +436,8 @@ pub fn step_free_flight(w: &World) -> (out: StepResult)
                     &&& q_nonneg(new_errs@[j]@)
                     &&& new_errs@[j]@.eqv_spec(
                         w.angle_err@[j]@.add_spec(ledger_increment(tj@, w.series_k as nat)))
+                    &&& angle_entries@[j]@.eqv_spec(
+                        ledger_increment(tj@, w.series_k as nat))
                 },
         decreases w.bodies.len() - i,
     {
@@ -457,6 +474,18 @@ pub fn step_free_flight(w: &World) -> (out: StepResult)
             new_bodies.push(b2);
             new_errs.push(e2);
             ts.push(t2);
+            let e_inc = RuntimeRational::from_int(0);
+            proof {
+                // entry ≡ 0 ≡ ledger_increment(0, k) (increment of a static
+                // body is exactly zero — lemma_ledger_increment_zero above)
+                let ghost inc = ledger_increment(t2@, w.series_k as nat);
+                let ghost z = Rational::from_int_spec(0);
+                lemma_ledger_increment_zero(t2@, w.series_k as nat);
+                Rational::lemma_eqv_reflexive(z);
+                Rational::lemma_eqv_symmetric(inc, z);
+                Rational::lemma_eqv_transitive(e_inc@, z, inc);
+            }
+            angle_entries.push(e_inc);
         } else {
             let gdt = w.gravity.scaled(&w.dt);
             let vel1 = w.bodies[i].vel.add(&gdt);
@@ -535,6 +564,12 @@ pub fn step_free_flight(w: &World) -> (out: StepResult)
             new_bodies.push(b2);
             new_errs.push(e2);
             ts.push(t);
+            proof {
+                // width@ == ledger_increment(t@, k) (asserted above); the
+                // cert entry is exactly the increment used.
+                Rational::lemma_eqv_reflexive(ledger_increment(t@, w.series_k as nat));
+            }
+            angle_entries.push(width);
         }
         i = i + 1;
     }
@@ -608,6 +643,8 @@ pub fn step_free_flight(w: &World) -> (out: StepResult)
                 &&& body_step_rel(w.bodies@[i], w2.bodies@[i], w.gravity.model@, w.dt@, ti@)
                 &&& w2.angle_err@[i]@.eqv_spec(
                     w.angle_err@[i]@.add_spec(ledger_increment(ti@, w.series_k as nat)))
+                &&& angle_entries@[i]@.eqv_spec(
+                    ledger_increment(ti@, w.series_k as nat))
             }
         by {
             let ti = ts@[i];
@@ -616,9 +653,17 @@ pub fn step_free_flight(w: &World) -> (out: StepResult)
             assert(body_step_rel(w.bodies@[i], w2.bodies@[i], w.gravity.model@, w.dt@, ti@));
             assert(w2.angle_err@[i]@.eqv_spec(
                 w.angle_err@[i]@.add_spec(ledger_increment(ti@, w.series_k as nat))));
+            assert(angle_entries@[i]@.eqv_spec(
+                ledger_increment(ti@, w.series_k as nat)));
         }
     }
-    StepResult::Ok(w2, ts)
+    let cert = StepCert {
+        rows: Vec::new(),
+        tan_halfs: ts,
+        snaps: Vec::new(),
+        angle_entries,
+    };
+    StepResult::Ok(w2, cert)
 }
 
 } // verus!

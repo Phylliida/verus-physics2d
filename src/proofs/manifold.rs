@@ -6,11 +6,12 @@
 
 use vstd::prelude::*;
 
+use verus_algebra::traits::*;
 use verus_linalg::vec2::Vec2;
 use verus_rational::Rational;
 
 use crate::massprops::{vdot, vscale};
-use crate::shape::{axis_sep, vadd, vsub};
+use crate::shape::{axis_sep, convex_poly_inv, edge_normal, orient, vadd, vsub};
 
 verus! {
 
@@ -110,6 +111,25 @@ pub proof fn lemma_sub_neg_swap(x: Rational, y: Rational)
     Rational::lemma_neg_add(y, x.neg_spec());
     // (−y) + x ≡ x + (−y) == x − y
     Rational::lemma_add_commutative(y.neg_spec(), x);
+}
+
+/// x − y == −(y − x) (structural — the den formula is symmetric).
+pub proof fn lemma_sub_neg_structural(x: Rational, y: Rational)
+    ensures
+        x.sub_spec(y) == y.sub_spec(x).neg_spec(),
+{
+    let d1 = x.denom_nat() as int;
+    let d2 = y.denom_nat() as int;
+    assert(x.sub_spec(y).num == x.num * d2 + (-y.num) * d1);
+    assert(y.sub_spec(x).neg_spec().num == -(y.num * d1 + (-x.num) * d2));
+    assert(x.sub_spec(y).den == x.den * y.den + x.den + y.den);
+    assert(y.sub_spec(x).den == y.den * x.den + y.den + x.den);
+    assert(x.sub_spec(y).num == y.sub_spec(x).neg_spec().num) by (nonlinear_arith)
+        requires
+            x.sub_spec(y).num == x.num * d2 + (-y.num) * d1,
+            y.sub_spec(x).neg_spec().num == -(y.num * d1 + (-x.num) * d2);
+    assert(x.sub_spec(y).den == y.sub_spec(x).neg_spec().den);
+    assert(x.sub_spec(y) == y.sub_spec(x).neg_spec());
 }
 
 //  ── vdot linearity ──────────────────────────────────────────────────
@@ -947,6 +967,897 @@ pub proof fn lemma_interp_rel_endpoints(a: Vec2<Rational>, b: Vec2<Rational>)
         a.x.add_spec(one.mul_spec(b.x.sub_spec(a.x))), b.x);
     Rational::lemma_eqv_symmetric(
         a.y.add_spec(one.mul_spec(b.y.sub_spec(a.y))), b.y);
+}
+
+} // verus!
+
+verus! {
+
+//  ── Negated-axis and zero-product lemmas ────────────────────────────
+
+/// vdot with a negated left argument (canonical trait neg).
+pub proof fn lemma_vdot_neg_left(d: Vec2<Rational>, w: Vec2<Rational>)
+    ensures
+        vdot(d.neg(), w).eqv_spec(vdot(d, w).neg_spec()),
+{
+    // trait neg canonicalizes: d.neg().x == d.x.neg_spec().canonical()
+    Rational::lemma_canonical_exists(d.x.neg_spec());
+    Rational::lemma_canonical_exists(d.y.neg_spec());
+    Rational::lemma_eqv_reflexive(w.x);
+    Rational::lemma_eqv_reflexive(w.y);
+    Rational::lemma_eqv_mul_congruence(
+        d.x.neg_spec().canonical(), d.x.neg_spec(), w.x, w.x);
+    Rational::lemma_eqv_mul_congruence(
+        d.y.neg_spec().canonical(), d.y.neg_spec(), w.y, w.y);
+    // (−dx)·wx ≡ −(dx·wx) etc. (mul_neg_right + commutativity, structural)
+    Rational::lemma_mul_neg_right(w.x, d.x);
+    Rational::lemma_mul_commutative(w.x, d.x);
+    Rational::lemma_mul_commutative(d.x.neg_spec(), w.x);
+    Rational::lemma_mul_neg_right(w.y, d.y);
+    Rational::lemma_mul_commutative(w.y, d.y);
+    Rational::lemma_mul_commutative(d.y.neg_spec(), w.y);
+    assert(d.x.neg_spec().mul_spec(w.x) == d.x.mul_spec(w.x).neg_spec());
+    assert(d.y.neg_spec().mul_spec(w.y) == d.y.mul_spec(w.y).neg_spec());
+    Rational::lemma_eqv_transitive(
+        d.neg().x.mul_spec(w.x), d.x.neg_spec().mul_spec(w.x), d.x.mul_spec(w.x).neg_spec());
+    Rational::lemma_eqv_transitive(
+        d.neg().y.mul_spec(w.y), d.y.neg_spec().mul_spec(w.y), d.y.mul_spec(w.y).neg_spec());
+    // sum ≡ −(dx·wx) + −(dy·wy) == −(dx·wx + dy·wy) (neg_add, structural)
+    Rational::lemma_eqv_add_congruence(
+        d.neg().x.mul_spec(w.x), d.x.mul_spec(w.x).neg_spec(),
+        d.neg().y.mul_spec(w.y), d.y.mul_spec(w.y).neg_spec());
+    Rational::lemma_neg_add(d.x.mul_spec(w.x), d.y.mul_spec(w.y));
+    Rational::lemma_eqv_transitive(
+        vdot(d.neg(), w),
+        d.x.mul_spec(w.x).neg_spec().add_spec(d.y.mul_spec(w.y).neg_spec()),
+        vdot(d, w).neg_spec());
+}
+
+/// axis_sep with a negated axis.
+pub proof fn lemma_axis_sep_neg_left(
+    d: Vec2<Rational>,
+    base: Vec2<Rational>,
+    q: Vec2<Rational>,
+)
+    ensures
+        axis_sep(d.neg(), base, q).eqv_spec(axis_sep(d, base, q).neg_spec()),
+{
+    // axis_sep(n, base, q) == vdot(n, vsub(q, base)) — structural.
+    lemma_vdot_neg_left(d, vsub(q, base));
+}
+
+/// x ≡ 0 ⟹ x·y ≡ 0.
+pub proof fn lemma_eqv_zero_mul_left(x: Rational, y: Rational)
+    requires
+        x.eqv_spec(Rational::from_int_spec(0)),
+    ensures
+        x.mul_spec(y).eqv_spec(Rational::from_int_spec(0)),
+{
+    Rational::lemma_eqv_zero_iff_num_zero(x);
+    Rational::lemma_eqv_zero_iff_num_zero(x.mul_spec(y));
+    assert(x.num == 0);
+    assert(x.mul_spec(y).num == x.num * y.num);
+}
+
+/// x·x ≡ 0 ⟹ x ≡ 0.
+pub proof fn lemma_sq_eqv_zero(x: Rational)
+    requires
+        x.mul_spec(x).eqv_spec(Rational::from_int_spec(0)),
+    ensures
+        x.eqv_spec(Rational::from_int_spec(0)),
+{
+    Rational::lemma_eqv_zero_iff_num_zero(x.mul_spec(x));
+    Rational::lemma_eqv_zero_iff_num_zero(x);
+    assert(x.mul_spec(x).num == x.num * x.num);
+    assert(x.num * x.num == 0 ==> x.num == 0) by (nonlinear_arith);
+}
+
+/// a ≥ 0 ∧ b ≥ 0 ∧ a + b ≡ 0 ⟹ a ≡ 0 ∧ b ≡ 0.
+pub proof fn lemma_nonneg_sum_zero(a: Rational, b: Rational)
+    requires
+        Rational::from_int_spec(0).le_spec(a),
+        Rational::from_int_spec(0).le_spec(b),
+        a.add_spec(b).eqv_spec(Rational::from_int_spec(0)),
+    ensures
+        a.eqv_spec(Rational::from_int_spec(0)),
+        b.eqv_spec(Rational::from_int_spec(0)),
+{
+    let zero = Rational::from_int_spec(0);
+    // a ≤ a + b ≤ 0
+    Rational::lemma_eqv_reflexive(a);
+    Rational::lemma_le_add_both(a, a, zero, b);
+    Rational::lemma_add_zero_identity(a);
+    crate::proofs::shape::lemma_le_eqv_subst_right(a, a.add_spec(b), zero);
+    Rational::lemma_le_antisymmetric(a, zero);
+    // b ≤ a + b ≤ 0
+    Rational::lemma_eqv_reflexive(b);
+    Rational::lemma_le_add_both(b, b, zero, a);
+    Rational::lemma_add_zero_identity(b);
+    // b ≤ b + a ≡ a + b ≡ 0
+    Rational::lemma_add_commutative(b, a);
+    Rational::lemma_eqv_transitive(b.add_spec(a), a.add_spec(b), zero);
+    crate::proofs::shape::lemma_le_eqv_subst_right(b, b.add_spec(a), zero);
+    Rational::lemma_le_antisymmetric(b, zero);
+}
+
+/// Adjacent vertices of a convex polygon differ: the edge normal of every
+/// edge has nonzero squared length (the |n|² ≢ 0 gate of SPEC §5 step 3).
+pub proof fn lemma_edge_normal_nonzero(vs: Seq<Vec2<Rational>>, i: int)
+    requires
+        convex_poly_inv(vs),
+        0 <= i < vs.len(),
+    ensures
+        !vdot(
+            edge_normal(vs[i], vs[(i + 1) % (vs.len() as int)]),
+            edge_normal(vs[i], vs[(i + 1) % (vs.len() as int)])).eqv_spec(
+            Rational::from_int_spec(0)),
+{
+    let n = vs.len();
+    let i1 = (i + 1) % (n as int);
+    let j = (i + 2) % (n as int);
+    let en = edge_normal(vs[i], vs[i1]);
+    // j is a valid off-edge index: j ≠ i and j ≠ i1 (n ≥ 3)
+    assert(n >= 3);
+    assert(j != i && j != i1) by {
+        vstd::arithmetic::div_mod::lemma_fundamental_div_mod((i + 2) as int, n as int);
+        vstd::arithmetic::div_mod::lemma_fundamental_div_mod((i + 1) as int, n as int);
+        assert(0 <= j && j < n);
+        assert(0 <= i1 && i1 < n);
+        assert(j != i) by (nonlinear_arith)
+            requires
+                n >= 3,
+                0 <= i < n as int,
+                i + 2 == (n as int) * ((i + 2) / (n as int)) + j,
+                0 <= j < n as int;
+        assert(j != i1) by (nonlinear_arith)
+            requires
+                n >= 3,
+                0 <= i < n as int,
+                i + 2 == (n as int) * ((i + 2) / (n as int)) + j,
+                i + 1 == (n as int) * ((i + 1) / (n as int)) + i1,
+                0 <= j < n as int,
+                0 <= i1 < n as int;
+    }
+    // convexity: orient > 0 at (i, i1, j)
+    assert(Rational::from_int_spec(0).lt_spec(orient(vs[i], vs[i1], vs[j])));
+    if vdot(en, en).eqv_spec(Rational::from_int_spec(0)) {
+        let zero = Rational::from_int_spec(0);
+        let d = vsub(vs[i1], vs[i]);
+        // en = (d.y, −d.x); |en|² ≡ 0 with squares ≥ 0 forces d.x ≡ d.y ≡ 0
+        Rational::lemma_square_le_nonneg(en.x);
+        Rational::lemma_square_le_nonneg(en.y);
+        lemma_nonneg_sum_zero(en.x.mul_spec(en.x), en.y.mul_spec(en.y));
+        lemma_sq_eqv_zero(en.x);
+        lemma_sq_eqv_zero(en.y);
+        assert(en.y == d.x.neg_spec()) by {
+            assert(en.y == vs[i].x.sub_spec(vs[i1].x));
+            assert(d.x == vs[i1].x.sub_spec(vs[i].x));
+            lemma_sub_neg_structural(vs[i].x, vs[i1].x);
+        }
+        Rational::lemma_eqv_neg_congruence(en.y, zero);
+        assert(zero.neg_spec() == zero);
+        // orient = d.x·w.y − d.y·w.x ≡ 0 — contradiction
+        let w = vsub(vs[j], vs[i]);
+        lemma_eqv_zero_mul_left(d.x, w.y);
+        lemma_eqv_zero_mul_left(d.y, w.x);
+        Rational::lemma_eqv_reflexive(zero);
+        Rational::lemma_eqv_sub_congruence(
+            d.x.mul_spec(w.y), zero, d.y.mul_spec(w.x), zero);
+        assert(d.x.mul_spec(w.y).sub_spec(d.y.mul_spec(w.x)).eqv_spec(
+            zero.sub_spec(zero)));
+        Rational::lemma_add_zero_identity(zero.neg_spec());
+        assert(zero.sub_spec(zero) == zero.add_spec(zero.neg_spec()));
+        assert(orient(vs[i], vs[i1], vs[j]).eqv_spec(zero));
+        Rational::lemma_trichotomy(zero, orient(vs[i], vs[i1], vs[j]));
+        assert(false);
+    }
+}
+
+} // verus!
+
+verus! {
+
+//  ── Basis decomposition over the reference edge ─────────────────────
+
+/// (a·b)·c ≡ (a·c)·b.
+pub proof fn lemma_mul_perm3(a: Rational, b: Rational, c: Rational)
+    ensures
+        a.mul_spec(b).mul_spec(c).eqv_spec(a.mul_spec(c).mul_spec(b)),
+{
+    Rational::lemma_mul_associative(a, b, c);
+    Rational::lemma_mul_commutative(b, c);
+    assert(a.mul_spec(b.mul_spec(c)) == a.mul_spec(c.mul_spec(b)));
+    Rational::lemma_mul_associative(a, c, b);
+    Rational::lemma_eqv_symmetric(
+        a.mul_spec(c).mul_spec(b), a.mul_spec(c.mul_spec(b)));
+    Rational::lemma_eqv_transitive(
+        a.mul_spec(b).mul_spec(c),
+        a.mul_spec(b.mul_spec(c)),
+        a.mul_spec(c).mul_spec(b));
+}
+
+/// (P + Q) + (R − Q) ≡ P + R.
+pub proof fn lemma_add_cancel_right(P: Rational, Q: Rational, R: Rational)
+    ensures
+        P.add_spec(Q).add_spec(R.sub_spec(Q)).eqv_spec(P.add_spec(R)),
+{
+    // (P+Q)+(R+(−Q)) ≡ P+(Q+(R+(−Q)))
+    Rational::lemma_add_associative(P, Q, R.sub_spec(Q));
+    // Q+(R+(−Q)) ≡ (R+(−Q))+Q ≡ R+((−Q)+Q) ≡ R+0 ≡ R
+    Rational::lemma_add_commutative(Q, R.sub_spec(Q));
+    Rational::lemma_add_associative(R, Q.neg_spec(), Q);
+    Rational::lemma_add_inverse(Q);
+    Rational::lemma_eqv_reflexive(R);
+    Rational::lemma_eqv_add_congruence(
+        R, R, Q.neg_spec().add_spec(Q), Rational::from_int_spec(0));
+    Rational::lemma_add_zero_identity(R);
+    Rational::lemma_eqv_transitive(
+        R.sub_spec(Q).add_spec(Q),
+        R.add_spec(Q.neg_spec().add_spec(Q)),
+        R.add_spec(Rational::from_int_spec(0)));
+    Rational::lemma_eqv_transitive(
+        R.sub_spec(Q).add_spec(Q),
+        R.add_spec(Rational::from_int_spec(0)),
+        R);
+    Rational::lemma_eqv_transitive(
+        Q.add_spec(R.sub_spec(Q)),
+        R.sub_spec(Q).add_spec(Q),
+        R);
+    // lift under P + (·)
+    Rational::lemma_eqv_reflexive(P);
+    Rational::lemma_eqv_add_congruence(P, P, Q.add_spec(R.sub_spec(Q)), R);
+    Rational::lemma_eqv_transitive(
+        P.add_spec(Q).add_spec(R.sub_spec(Q)),
+        P.add_spec(Q.add_spec(R.sub_spec(Q))),
+        P.add_spec(R));
+}
+
+/// (X + Y) − X ≡ Y.
+pub proof fn lemma_add_sub_cancel_right(X: Rational, Y: Rational)
+    ensures
+        X.add_spec(Y).sub_spec(X).eqv_spec(Y),
+{
+    // (X+Y)−X == (Y+X)+(−X) ≡ Y+(X+(−X)) ≡ Y+0 ≡ Y
+    Rational::lemma_add_commutative(X, Y);
+    Rational::lemma_add_associative(Y, X, X.neg_spec());
+    Rational::lemma_eqv_symmetric(
+        Y.add_spec(X).add_spec(X.neg_spec()), Y.add_spec(X.add_spec(X.neg_spec())));
+    Rational::lemma_add_inverse(X);
+    Rational::lemma_eqv_reflexive(Y);
+    Rational::lemma_eqv_add_congruence(
+        Y, Y, X.add_spec(X.neg_spec()), Rational::from_int_spec(0));
+    Rational::lemma_add_zero_identity(Y);
+    Rational::lemma_eqv_transitive(
+        Y.add_spec(X.add_spec(X.neg_spec())),
+        Y.add_spec(Rational::from_int_spec(0)),
+        Y);
+    Rational::lemma_eqv_transitive(
+        Y.add_spec(X).add_spec(X.neg_spec()),
+        Y.add_spec(X.add_spec(X.neg_spec())),
+        Y);
+    Rational::lemma_eqv_transitive(
+        X.add_spec(Y).add_spec(X.neg_spec()),
+        Y.add_spec(X).add_spec(X.neg_spec()),
+        Y);
+}
+
+/// (X + Y) − (X − W) ≡ Y + W.
+pub proof fn lemma_sub_sub_swap_xy(X: Rational, Y: Rational, W: Rational)
+    ensures
+        X.add_spec(Y).sub_spec(X.sub_spec(W)).eqv_spec(Y.add_spec(W)),
+{
+    // −(X−W) == W−X (structural)
+    lemma_sub_neg_structural(W, X);
+    // (X+Y)+(W−X) ≡ ((X+Y)+W)−X [assoc, symmetric]
+    Rational::lemma_add_associative(X.add_spec(Y), W, X.neg_spec());
+    Rational::lemma_eqv_symmetric(
+        X.add_spec(Y).add_spec(W).add_spec(X.neg_spec()),
+        X.add_spec(Y).add_spec(W.add_spec(X.neg_spec())));
+    // ((X+Y)+W)−X ≡ ((X+Y)−X)+W [swap]
+    lemma_add_sub_swap(X.add_spec(Y), W, X);
+    // (X+Y)−X ≡ Y [cancel_right]; lift under (·)+W
+    lemma_add_sub_cancel_right(X, Y);
+    Rational::lemma_eqv_reflexive(W);
+    Rational::lemma_eqv_add_congruence(
+        X.add_spec(Y).sub_spec(X), Y, W, W);
+    // chain
+    Rational::lemma_eqv_transitive(
+        X.add_spec(Y).add_spec(W).sub_spec(X),
+        X.add_spec(Y).sub_spec(X).add_spec(W),
+        Y.add_spec(W));
+    Rational::lemma_eqv_transitive(
+        X.add_spec(Y).add_spec(W).add_spec(X.neg_spec()),
+        X.add_spec(Y).add_spec(W).sub_spec(X),
+        Y.add_spec(W));
+    Rational::lemma_eqv_transitive(
+        X.add_spec(Y).add_spec(W.add_spec(X.neg_spec())),
+        X.add_spec(Y).add_spec(W).add_spec(X.neg_spec()),
+        Y.add_spec(W));
+    // (X+Y)−(X−W) == (X+Y)+(W−X) — sub is add-neg, structural
+    assert(X.add_spec(Y).sub_spec(X.sub_spec(W))
+        == X.add_spec(Y).add_spec(W.sub_spec(X)));
+    Rational::lemma_eqv_transitive(
+        X.add_spec(Y).sub_spec(X.sub_spec(W)),
+        X.add_spec(Y).add_spec(W.sub_spec(X)),
+        Y.add_spec(W));
+}
+
+/// (dx·ux + dy·uy)·dx ≡ dx²·ux + (dx·dy)·uy.
+pub proof fn lemma_basis_term_x1(
+    dx: Rational,
+    dy: Rational,
+    ux: Rational,
+    uy: Rational,
+)
+    ensures
+        dx.mul_spec(ux).add_spec(dy.mul_spec(uy)).mul_spec(dx).eqv_spec(
+            dx.mul_spec(dx).mul_spec(ux).add_spec(dx.mul_spec(dy).mul_spec(uy))),
+{
+    let a = dx.mul_spec(ux);
+    let b = dy.mul_spec(uy);
+    // dx·(a+b) ≡ dx·a + dx·b
+    Rational::lemma_mul_distributes_over_add(dx, a, b);
+    // dx·a == a·dx ≡ dx²·ux ; dx·b == b·dx ≡ (dy·dx)·uy == (dx·dy)·uy
+    lemma_mul_perm3(dx, ux, dx);
+    lemma_mul_perm3(dy, uy, dx);
+    Rational::lemma_mul_commutative(dx, a);
+    Rational::lemma_mul_commutative(dx, b);
+    Rational::lemma_mul_commutative(dy, dx);
+    assert(dx.mul_spec(b) == dy.mul_spec(dx).mul_spec(uy)
+        || dx.mul_spec(b) == dy.mul_spec(uy).mul_spec(dx));
+    assert(dy.mul_spec(dx).mul_spec(uy) == dx.mul_spec(dy).mul_spec(uy));
+    Rational::lemma_eqv_reflexive(a.mul_spec(dx));
+    Rational::lemma_eqv_reflexive(dx.mul_spec(dy).mul_spec(uy));
+    Rational::lemma_eqv_add_congruence(
+        dx.mul_spec(a), a.mul_spec(dx),
+        dx.mul_spec(b), dx.mul_spec(dy).mul_spec(uy));
+    Rational::lemma_eqv_reflexive(dx.mul_spec(dx).mul_spec(ux));
+    Rational::lemma_eqv_add_congruence(
+        a.mul_spec(dx), dx.mul_spec(dx).mul_spec(ux),
+        dx.mul_spec(dy).mul_spec(uy), dx.mul_spec(dy).mul_spec(uy));
+    Rational::lemma_eqv_transitive(
+        dx.mul_spec(a).add_spec(dx.mul_spec(b)),
+        a.mul_spec(dx).add_spec(dx.mul_spec(dy).mul_spec(uy)),
+        dx.mul_spec(dx).mul_spec(ux).add_spec(dx.mul_spec(dy).mul_spec(uy)));
+    // (a+b)·dx == dx·(a+b) structural
+    Rational::lemma_mul_commutative(a.add_spec(b), dx);
+    Rational::lemma_eqv_transitive(
+        a.add_spec(b).mul_spec(dx),
+        dx.mul_spec(a).add_spec(dx.mul_spec(b)),
+        dx.mul_spec(dx).mul_spec(ux).add_spec(dx.mul_spec(dy).mul_spec(uy)));
+}
+
+/// (dy·ux − dx·uy)·dy ≡ dy²·ux − (dx·dy)·uy.
+pub proof fn lemma_basis_term_x2(
+    dx: Rational,
+    dy: Rational,
+    ux: Rational,
+    uy: Rational,
+)
+    ensures
+        dy.mul_spec(ux).sub_spec(dx.mul_spec(uy)).mul_spec(dy).eqv_spec(
+            dy.mul_spec(dy).mul_spec(ux).sub_spec(dx.mul_spec(dy).mul_spec(uy))),
+{
+    let c = dy.mul_spec(ux);
+    let d = dx.mul_spec(uy);
+    // dy·(c−d) ≡ dy·c − dy·d
+    lemma_mul_distributes_over_sub(dy, c, d);
+    lemma_mul_perm3(dy, ux, dy);
+    // dy·c == c·dy ≡ dy²·ux
+    lemma_mul_perm3(dx, uy, dy);
+    // dy·d == d·dy ≡ (dx·dy)·uy
+    Rational::lemma_mul_commutative(dy, c);
+    Rational::lemma_mul_commutative(dy, d);
+    Rational::lemma_eqv_reflexive(c.mul_spec(dy));
+    Rational::lemma_eqv_reflexive(d.mul_spec(dy));
+    Rational::lemma_eqv_sub_congruence(
+        dy.mul_spec(c), c.mul_spec(dy), dy.mul_spec(d), d.mul_spec(dy));
+    Rational::lemma_eqv_reflexive(dy.mul_spec(dy).mul_spec(ux));
+    Rational::lemma_eqv_reflexive(dx.mul_spec(dy).mul_spec(uy));
+    Rational::lemma_eqv_sub_congruence(
+        c.mul_spec(dy), dy.mul_spec(dy).mul_spec(ux),
+        d.mul_spec(dy), dx.mul_spec(dy).mul_spec(uy));
+    Rational::lemma_eqv_transitive(
+        dy.mul_spec(c).sub_spec(dy.mul_spec(d)),
+        c.mul_spec(dy).sub_spec(d.mul_spec(dy)),
+        dy.mul_spec(dy).mul_spec(ux).sub_spec(dx.mul_spec(dy).mul_spec(uy)));
+    Rational::lemma_mul_commutative(c.sub_spec(d), dy);
+    Rational::lemma_eqv_transitive(
+        c.sub_spec(d).mul_spec(dy),
+        dy.mul_spec(c).sub_spec(dy.mul_spec(d)),
+        dy.mul_spec(dy).mul_spec(ux).sub_spec(dx.mul_spec(dy).mul_spec(uy)));
+}
+
+/// The x-component numerator of the edge-basis expansion:
+/// (dx·ux + dy·uy)·dx + (dy·ux − dx·uy)·dy ≡ (dx² + dy²)·ux.
+pub proof fn lemma_basis_decomp_scalar_x(
+    dx: Rational,
+    dy: Rational,
+    ux: Rational,
+    uy: Rational,
+)
+    ensures
+        dx.mul_spec(ux).add_spec(dy.mul_spec(uy)).mul_spec(dx).add_spec(
+            dy.mul_spec(ux).sub_spec(dx.mul_spec(uy)).mul_spec(dy)).eqv_spec(
+            dx.mul_spec(dx).add_spec(dy.mul_spec(dy)).mul_spec(ux)),
+{
+    let l = dx.mul_spec(dx).add_spec(dy.mul_spec(dy));
+    lemma_basis_term_x1(dx, dy, ux, uy);
+    lemma_basis_term_x2(dx, dy, ux, uy);
+    // sum ≡ (dx²·ux + dxdy·uy) + (dy²·ux − dxdy·uy) ≡ dx²·ux + dy²·ux
+    Rational::lemma_eqv_add_congruence(
+        dx.mul_spec(ux).add_spec(dy.mul_spec(uy)).mul_spec(dx),
+        dx.mul_spec(dx).mul_spec(ux).add_spec(dx.mul_spec(dy).mul_spec(uy)),
+        dy.mul_spec(ux).sub_spec(dx.mul_spec(uy)).mul_spec(dy),
+        dy.mul_spec(dy).mul_spec(ux).sub_spec(dx.mul_spec(dy).mul_spec(uy)));
+    lemma_add_cancel_right(
+        dx.mul_spec(dx).mul_spec(ux),
+        dx.mul_spec(dy).mul_spec(uy),
+        dy.mul_spec(dy).mul_spec(ux));
+    Rational::lemma_eqv_transitive(
+        dx.mul_spec(ux).add_spec(dy.mul_spec(uy)).mul_spec(dx).add_spec(
+            dy.mul_spec(ux).sub_spec(dx.mul_spec(uy)).mul_spec(dy)),
+        dx.mul_spec(dx).mul_spec(ux).add_spec(dx.mul_spec(dy).mul_spec(uy)).add_spec(
+            dy.mul_spec(dy).mul_spec(ux).sub_spec(dx.mul_spec(dy).mul_spec(uy))),
+        dx.mul_spec(dx).mul_spec(ux).add_spec(dy.mul_spec(dy).mul_spec(ux)));
+    // dx²·ux + dy²·ux ≡ ux·(dx²+dy²) == l·ux
+    Rational::lemma_mul_distributes_over_add(ux, dx.mul_spec(dx), dy.mul_spec(dy));
+    Rational::lemma_mul_commutative(ux, dx.mul_spec(dx));
+    Rational::lemma_mul_commutative(ux, dy.mul_spec(dy));
+    assert(ux.mul_spec(dx.mul_spec(dx)) == dx.mul_spec(dx).mul_spec(ux));
+    assert(ux.mul_spec(dy.mul_spec(dy)) == dy.mul_spec(dy).mul_spec(ux));
+    Rational::lemma_mul_commutative(l, ux);
+    Rational::lemma_eqv_reflexive(l.mul_spec(ux));
+    Rational::lemma_eqv_transitive(
+        dx.mul_spec(dx).mul_spec(ux).add_spec(dy.mul_spec(dy).mul_spec(ux)),
+        ux.mul_spec(l),
+        l.mul_spec(ux));
+    Rational::lemma_eqv_transitive(
+        dx.mul_spec(ux).add_spec(dy.mul_spec(uy)).mul_spec(dx).add_spec(
+            dy.mul_spec(ux).sub_spec(dx.mul_spec(uy)).mul_spec(dy)),
+        dx.mul_spec(dx).mul_spec(ux).add_spec(dy.mul_spec(dy).mul_spec(ux)),
+        l.mul_spec(ux));
+}
+
+/// (dx·ux + dy·uy)·dy ≡ (dx·dy)·ux + dy²·uy.
+pub proof fn lemma_basis_term_y1(
+    dx: Rational,
+    dy: Rational,
+    ux: Rational,
+    uy: Rational,
+)
+    ensures
+        dx.mul_spec(ux).add_spec(dy.mul_spec(uy)).mul_spec(dy).eqv_spec(
+            dx.mul_spec(dy).mul_spec(ux).add_spec(dy.mul_spec(dy).mul_spec(uy))),
+{
+    let a = dx.mul_spec(ux);
+    let b = dy.mul_spec(uy);
+    Rational::lemma_mul_distributes_over_add(dy, a, b);
+    lemma_mul_perm3(dx, ux, dy);
+    // dy·a == a·dy ≡ (dx·dy)·ux
+    lemma_mul_perm3(dy, uy, dy);
+    // dy·b == b·dy ≡ dy²·uy
+    Rational::lemma_mul_commutative(dy, a);
+    Rational::lemma_mul_commutative(dy, b);
+    Rational::lemma_eqv_reflexive(a.mul_spec(dy));
+    Rational::lemma_eqv_reflexive(b.mul_spec(dy));
+    Rational::lemma_eqv_add_congruence(
+        dy.mul_spec(a), a.mul_spec(dy), dy.mul_spec(b), b.mul_spec(dy));
+    Rational::lemma_eqv_reflexive(dx.mul_spec(dy).mul_spec(ux));
+    Rational::lemma_eqv_reflexive(dy.mul_spec(dy).mul_spec(uy));
+    Rational::lemma_eqv_add_congruence(
+        a.mul_spec(dy), dx.mul_spec(dy).mul_spec(ux),
+        b.mul_spec(dy), dy.mul_spec(dy).mul_spec(uy));
+    Rational::lemma_eqv_transitive(
+        dy.mul_spec(a).add_spec(dy.mul_spec(b)),
+        a.mul_spec(dy).add_spec(b.mul_spec(dy)),
+        dx.mul_spec(dy).mul_spec(ux).add_spec(dy.mul_spec(dy).mul_spec(uy)));
+    Rational::lemma_mul_commutative(a.add_spec(b), dy);
+    Rational::lemma_eqv_transitive(
+        a.add_spec(b).mul_spec(dy),
+        dy.mul_spec(a).add_spec(dy.mul_spec(b)),
+        dx.mul_spec(dy).mul_spec(ux).add_spec(dy.mul_spec(dy).mul_spec(uy)));
+}
+
+/// (dy·ux − dx·uy)·dx ≡ (dx·dy)·ux − dx²·uy.
+pub proof fn lemma_basis_term_y2(
+    dx: Rational,
+    dy: Rational,
+    ux: Rational,
+    uy: Rational,
+)
+    ensures
+        dy.mul_spec(ux).sub_spec(dx.mul_spec(uy)).mul_spec(dx).eqv_spec(
+            dx.mul_spec(dy).mul_spec(ux).sub_spec(dx.mul_spec(dx).mul_spec(uy))),
+{
+    let c = dy.mul_spec(ux);
+    let d = dx.mul_spec(uy);
+    lemma_mul_distributes_over_sub(dx, c, d);
+    lemma_mul_perm3(dy, ux, dx);
+    // dx·c == c·dx ≡ (dy·dx)·ux == (dx·dy)·ux
+    lemma_mul_perm3(dx, uy, dx);
+    // dx·d == d·dx ≡ dx²·uy
+    Rational::lemma_mul_commutative(dx, c);
+    Rational::lemma_mul_commutative(dx, d);
+    Rational::lemma_mul_commutative(dy, dx);
+    assert(dy.mul_spec(dx).mul_spec(ux) == dx.mul_spec(dy).mul_spec(ux));
+    Rational::lemma_eqv_reflexive(dx.mul_spec(dy).mul_spec(ux));
+    Rational::lemma_eqv_reflexive(dx.mul_spec(dx).mul_spec(uy));
+    Rational::lemma_eqv_sub_congruence(
+        dx.mul_spec(c), dx.mul_spec(dy).mul_spec(ux),
+        dx.mul_spec(d), dx.mul_spec(dx).mul_spec(uy));
+    Rational::lemma_eqv_transitive(
+        dx.mul_spec(c).sub_spec(dx.mul_spec(d)),
+        dx.mul_spec(dy).mul_spec(ux).sub_spec(dx.mul_spec(dx).mul_spec(uy)),
+        dx.mul_spec(dy).mul_spec(ux).sub_spec(dx.mul_spec(dx).mul_spec(uy)));
+    Rational::lemma_mul_commutative(c.sub_spec(d), dx);
+    Rational::lemma_eqv_transitive(
+        c.sub_spec(d).mul_spec(dx),
+        dx.mul_spec(c).sub_spec(dx.mul_spec(d)),
+        dx.mul_spec(dy).mul_spec(ux).sub_spec(dx.mul_spec(dx).mul_spec(uy)));
+}
+
+/// The y-component numerator: (dx·ux + dy·uy)·dy − (dy·ux − dx·uy)·dx
+/// ≡ (dx² + dy²)·uy.
+pub proof fn lemma_basis_decomp_scalar_y(
+    dx: Rational,
+    dy: Rational,
+    ux: Rational,
+    uy: Rational,
+)
+    ensures
+        dx.mul_spec(ux).add_spec(dy.mul_spec(uy)).mul_spec(dy).sub_spec(
+            dy.mul_spec(ux).sub_spec(dx.mul_spec(uy)).mul_spec(dx)).eqv_spec(
+            dx.mul_spec(dx).add_spec(dy.mul_spec(dy)).mul_spec(uy)),
+{
+    let l = dx.mul_spec(dx).add_spec(dy.mul_spec(dy));
+    lemma_basis_term_y1(dx, dy, ux, uy);
+    lemma_basis_term_y2(dx, dy, ux, uy);
+    // (X + Y) − (X − W) ≡ Y + W with X = dxdy·ux, Y = dy²·uy, W = dx²·uy
+    Rational::lemma_eqv_sub_congruence(
+        dx.mul_spec(ux).add_spec(dy.mul_spec(uy)).mul_spec(dy),
+        dx.mul_spec(dy).mul_spec(ux).add_spec(dy.mul_spec(dy).mul_spec(uy)),
+        dy.mul_spec(ux).sub_spec(dx.mul_spec(uy)).mul_spec(dx),
+        dx.mul_spec(dy).mul_spec(ux).sub_spec(dx.mul_spec(dx).mul_spec(uy)));
+    lemma_sub_sub_swap_xy(
+        dx.mul_spec(dy).mul_spec(ux),
+        dy.mul_spec(dy).mul_spec(uy),
+        dx.mul_spec(dx).mul_spec(uy));
+    Rational::lemma_eqv_transitive(
+        dx.mul_spec(ux).add_spec(dy.mul_spec(uy)).mul_spec(dy).sub_spec(
+            dy.mul_spec(ux).sub_spec(dx.mul_spec(uy)).mul_spec(dx)),
+        dx.mul_spec(dy).mul_spec(ux).add_spec(dy.mul_spec(dy).mul_spec(uy)).sub_spec(
+            dx.mul_spec(dy).mul_spec(ux).sub_spec(dx.mul_spec(dx).mul_spec(uy))),
+        dy.mul_spec(dy).mul_spec(uy).add_spec(dx.mul_spec(dx).mul_spec(uy)));
+    // dy²·uy + dx²·uy ≡ uy·l == l·uy
+    Rational::lemma_mul_distributes_over_add(uy, dx.mul_spec(dx), dy.mul_spec(dy));
+    Rational::lemma_mul_commutative(uy, dx.mul_spec(dx));
+    Rational::lemma_mul_commutative(uy, dy.mul_spec(dy));
+    assert(uy.mul_spec(dx.mul_spec(dx)) == dx.mul_spec(dx).mul_spec(uy));
+    assert(uy.mul_spec(dy.mul_spec(dy)) == dy.mul_spec(dy).mul_spec(uy));
+    Rational::lemma_mul_commutative(l, uy);
+    Rational::lemma_eqv_reflexive(l.mul_spec(uy));
+    Rational::lemma_add_commutative(
+        dy.mul_spec(dy).mul_spec(uy), dx.mul_spec(dx).mul_spec(uy));
+    Rational::lemma_eqv_transitive(
+        dy.mul_spec(dy).mul_spec(uy).add_spec(dx.mul_spec(dx).mul_spec(uy)),
+        dx.mul_spec(dx).mul_spec(uy).add_spec(dy.mul_spec(dy).mul_spec(uy)),
+        uy.mul_spec(l));
+    Rational::lemma_eqv_transitive(
+        dy.mul_spec(dy).mul_spec(uy).add_spec(dx.mul_spec(dx).mul_spec(uy)),
+        uy.mul_spec(l),
+        l.mul_spec(uy));
+    Rational::lemma_eqv_transitive(
+        dx.mul_spec(ux).add_spec(dy.mul_spec(uy)).mul_spec(dy).sub_spec(
+            dy.mul_spec(ux).sub_spec(dx.mul_spec(uy)).mul_spec(dx)),
+        dy.mul_spec(dy).mul_spec(uy).add_spec(dx.mul_spec(dx).mul_spec(uy)),
+        l.mul_spec(uy));
+}
+
+/// The exact decomposition of a point over the reference-edge basis:
+/// q ≡ p0 + t·d + s·n with t = dot(d, q − p0)/|d|², s = dot(n, q − p0)/|d|².
+pub proof fn lemma_basis_decomposition(
+    p0: Vec2<Rational>,
+    p1: Vec2<Rational>,
+    q: Vec2<Rational>,
+)
+    requires
+        !vdot(vsub(p1, p0), vsub(p1, p0)).eqv_spec(Rational::from_int_spec(0)),
+    ensures ({
+        let d = vsub(p1, p0);
+        let n = edge_normal(p0, p1);
+        let l = vdot(d, d);
+        let delta = vsub(q, p0);
+        let t = vdot(d, delta).div_spec(l);
+        let s = vdot(n, delta).div_spec(l);
+        &&& q.x.eqv_spec(vadd(p0, vadd(vscale(t, d), vscale(s, n))).x)
+        &&& q.y.eqv_spec(vadd(p0, vadd(vscale(t, d), vscale(s, n))).y)
+    }),
+{
+    let d = vsub(p1, p0);
+    let n = edge_normal(p0, p1);
+    let l = vdot(d, d);
+    let delta = vsub(q, p0);
+    let t = vdot(d, delta).div_spec(l);
+    let s = vdot(n, delta).div_spec(l);
+    // structural forms
+    assert(n.x == d.y);
+    assert(n.y == p0.x.sub_spec(p1.x));
+    lemma_sub_neg_structural(p0.x, p1.x);
+    assert(n.y == d.x.neg_spec());
+    assert(vdot(d, delta) == d.x.mul_spec(delta.x).add_spec(d.y.mul_spec(delta.y)));
+    assert(vdot(n, delta) == d.y.mul_spec(delta.x).add_spec(d.x.neg_spec().mul_spec(delta.y)));
+    Rational::lemma_mul_neg_right(delta.y, d.x);
+    Rational::lemma_mul_commutative(delta.y, d.x);
+    Rational::lemma_mul_commutative(d.x.neg_spec(), delta.y);
+    assert(d.x.neg_spec().mul_spec(delta.y) == d.x.mul_spec(delta.y).neg_spec());
+    // t·d.x + s·n.x ≡ (vdot(d,Δ)·d.x + vdot(n,Δ)·d.y) / l ≡ (l·Δ.x)/l ≡ Δ.x
+    Rational::lemma_div_mul_assoc(vdot(d, delta), l, d.x);
+    Rational::lemma_div_mul_assoc(vdot(n, delta), l, n.x);
+    Rational::lemma_div_add_numerator(
+        vdot(d, delta).mul_spec(d.x), vdot(n, delta).mul_spec(n.x), l);
+    Rational::lemma_eqv_symmetric(
+        vdot(d, delta).mul_spec(d.x).add_spec(vdot(n, delta).mul_spec(n.x)).div_spec(l),
+        vdot(d, delta).mul_spec(d.x).div_spec(l).add_spec(
+            vdot(n, delta).mul_spec(n.x).div_spec(l)));
+    lemma_basis_decomp_scalar_x(d.x, d.y, delta.x, delta.y);
+    assert(vdot(d, delta).mul_spec(d.x).add_spec(vdot(n, delta).mul_spec(n.x))
+        == d.x.mul_spec(delta.x).add_spec(d.y.mul_spec(delta.y)).mul_spec(d.x).add_spec(
+            d.y.mul_spec(delta.x).sub_spec(d.x.mul_spec(delta.y)).mul_spec(d.y)));
+    Rational::lemma_eqv_transitive(
+        vdot(d, delta).mul_spec(d.x).add_spec(vdot(n, delta).mul_spec(n.x)),
+        d.x.mul_spec(delta.x).add_spec(d.y.mul_spec(delta.y)).mul_spec(d.x).add_spec(
+            d.y.mul_spec(delta.x).sub_spec(d.x.mul_spec(delta.y)).mul_spec(d.y)),
+        l.mul_spec(delta.x));
+    Rational::lemma_div_congruence(
+        vdot(d, delta).mul_spec(d.x).add_spec(vdot(n, delta).mul_spec(n.x)),
+        l.mul_spec(delta.x), l);
+    Rational::lemma_mul_commutative(l, delta.x);
+    Rational::lemma_div_mul_cancel(delta.x, l);
+    assert(delta.x.mul_spec(l) == l.mul_spec(delta.x));
+    // chain x: t·d.x + s·n.x ≡ Δ.x
+    Rational::lemma_eqv_add_congruence(
+        t.mul_spec(d.x), vdot(d, delta).mul_spec(d.x).div_spec(l),
+        s.mul_spec(n.x), vdot(n, delta).mul_spec(n.x).div_spec(l));
+    Rational::lemma_eqv_transitive(
+        t.mul_spec(d.x).add_spec(s.mul_spec(n.x)),
+        vdot(d, delta).mul_spec(d.x).div_spec(l).add_spec(
+            vdot(n, delta).mul_spec(n.x).div_spec(l)),
+        vdot(d, delta).mul_spec(d.x).add_spec(vdot(n, delta).mul_spec(n.x)).div_spec(l));
+    Rational::lemma_eqv_transitive(
+        t.mul_spec(d.x).add_spec(s.mul_spec(n.x)),
+        vdot(d, delta).mul_spec(d.x).add_spec(vdot(n, delta).mul_spec(n.x)).div_spec(l),
+        l.mul_spec(delta.x).div_spec(l));
+    Rational::lemma_eqv_transitive(
+        t.mul_spec(d.x).add_spec(s.mul_spec(n.x)),
+        l.mul_spec(delta.x).div_spec(l),
+        delta.x);
+    // p0.x + Δ.x ≡ q.x
+    lemma_add_sub_cancel(p0.x, q.x);
+    Rational::lemma_eqv_reflexive(p0.x);
+    Rational::lemma_eqv_add_congruence(
+        p0.x, p0.x, t.mul_spec(d.x).add_spec(s.mul_spec(n.x)), delta.x);
+    assert(delta.x == q.x.sub_spec(p0.x));
+    Rational::lemma_eqv_transitive(
+        p0.x.add_spec(t.mul_spec(d.x).add_spec(s.mul_spec(n.x))),
+        p0.x.add_spec(delta.x),
+        q.x);
+    Rational::lemma_eqv_symmetric(
+        p0.x.add_spec(t.mul_spec(d.x).add_spec(s.mul_spec(n.x))), q.x);
+    // t·d.y + s·n.y ≡ (vdot(d,Δ)·d.y − vdot(n,Δ)·d.x) / l ≡ (l·Δ.y)/l ≡ Δ.y
+    Rational::lemma_div_mul_assoc(vdot(d, delta), l, d.y);
+    Rational::lemma_div_mul_assoc(vdot(n, delta), l, d.x);
+    // s·n.y == s·(−d.x) == −(s·d.x) ≡ −(vdot(n,Δ)·d.x / l)
+    assert(s.mul_spec(n.y) == s.mul_spec(d.x.neg_spec()));
+    Rational::lemma_mul_neg_right(s, d.x);
+    assert(s.mul_spec(d.x.neg_spec()) == s.mul_spec(d.x).neg_spec());
+    Rational::lemma_eqv_neg_congruence(
+        s.mul_spec(d.x), vdot(n, delta).mul_spec(d.x).div_spec(l));
+    // (−X)/l == −(X/l) — structural through mul_neg_right
+    assert(vdot(n, delta).mul_spec(d.x).neg_spec().div_spec(l)
+        == vdot(n, delta).mul_spec(d.x).div_spec(l).neg_spec()) by {
+        Rational::lemma_mul_neg_right(l.reciprocal_spec(), vdot(n, delta).mul_spec(d.x));
+        Rational::lemma_mul_commutative(l.reciprocal_spec(), vdot(n, delta).mul_spec(d.x));
+        Rational::lemma_mul_commutative(
+            vdot(n, delta).mul_spec(d.x).neg_spec(), l.reciprocal_spec());
+    }
+    // combine
+    Rational::lemma_eqv_add_congruence(
+        t.mul_spec(d.y), vdot(d, delta).mul_spec(d.y).div_spec(l),
+        s.mul_spec(n.y), vdot(n, delta).mul_spec(d.x).div_spec(l).neg_spec());
+    Rational::lemma_div_add_numerator(
+        vdot(d, delta).mul_spec(d.y),
+        vdot(n, delta).mul_spec(d.x).neg_spec(), l);
+    Rational::lemma_eqv_transitive(
+        t.mul_spec(d.y).add_spec(s.mul_spec(n.y)),
+        vdot(d, delta).mul_spec(d.y).div_spec(l).add_spec(
+            vdot(n, delta).mul_spec(d.x).div_spec(l).neg_spec()),
+        vdot(d, delta).mul_spec(d.y).add_spec(
+            vdot(n, delta).mul_spec(d.x).neg_spec()).div_spec(l));
+    // numerator ≡ l·Δ.y
+    lemma_basis_decomp_scalar_y(d.x, d.y, delta.x, delta.y);
+    assert(vdot(d, delta).mul_spec(d.y).add_spec(vdot(n, delta).mul_spec(d.x).neg_spec())
+        == vdot(d, delta).mul_spec(d.y).sub_spec(vdot(n, delta).mul_spec(d.x)));
+    assert(vdot(d, delta).mul_spec(d.y).sub_spec(vdot(n, delta).mul_spec(d.x))
+        == d.x.mul_spec(delta.x).add_spec(d.y.mul_spec(delta.y)).mul_spec(d.y).sub_spec(
+            d.y.mul_spec(delta.x).sub_spec(d.x.mul_spec(delta.y)).mul_spec(d.x)));
+    Rational::lemma_eqv_transitive(
+        vdot(d, delta).mul_spec(d.y).add_spec(vdot(n, delta).mul_spec(d.x).neg_spec()),
+        vdot(d, delta).mul_spec(d.y).sub_spec(vdot(n, delta).mul_spec(d.x)),
+        l.mul_spec(delta.y));
+    Rational::lemma_div_congruence(
+        vdot(d, delta).mul_spec(d.y).add_spec(vdot(n, delta).mul_spec(d.x).neg_spec()),
+        l.mul_spec(delta.y), l);
+    Rational::lemma_mul_commutative(l, delta.y);
+    Rational::lemma_div_mul_cancel(delta.y, l);
+    Rational::lemma_eqv_transitive(
+        t.mul_spec(d.y).add_spec(s.mul_spec(n.y)),
+        vdot(d, delta).mul_spec(d.y).add_spec(
+            vdot(n, delta).mul_spec(d.x).neg_spec()).div_spec(l),
+        l.mul_spec(delta.y).div_spec(l));
+    Rational::lemma_eqv_transitive(
+        t.mul_spec(d.y).add_spec(s.mul_spec(n.y)),
+        l.mul_spec(delta.y).div_spec(l),
+        delta.y);
+    lemma_add_sub_cancel(p0.y, q.y);
+    Rational::lemma_eqv_reflexive(p0.y);
+    Rational::lemma_eqv_add_congruence(
+        p0.y, p0.y, t.mul_spec(d.y).add_spec(s.mul_spec(n.y)), delta.y);
+    assert(delta.y == q.y.sub_spec(p0.y));
+    Rational::lemma_eqv_transitive(
+        p0.y.add_spec(t.mul_spec(d.y).add_spec(s.mul_spec(n.y))),
+        p0.y.add_spec(delta.y),
+        q.y);
+    Rational::lemma_eqv_symmetric(
+        p0.y.add_spec(t.mul_spec(d.y).add_spec(s.mul_spec(n.y))), q.y);
+}
+
+} // verus!
+
+verus! {
+
+//  ── Span assembly ───────────────────────────────────────────────────
+
+/// Congruence: component-wise eqv axes have eqv dots.
+pub proof fn lemma_vdot_congruence_left(
+    n1: Vec2<Rational>,
+    n2: Vec2<Rational>,
+    w: Vec2<Rational>,
+)
+    requires
+        n1.x.eqv_spec(n2.x),
+        n1.y.eqv_spec(n2.y),
+    ensures
+        vdot(n1, w).eqv_spec(vdot(n2, w)),
+{
+    Rational::lemma_eqv_reflexive(w.x);
+    Rational::lemma_eqv_reflexive(w.y);
+    Rational::lemma_eqv_mul_congruence(n1.x, n2.x, w.x, w.x);
+    Rational::lemma_eqv_mul_congruence(n1.y, n2.y, w.y, w.y);
+    Rational::lemma_eqv_add_congruence(
+        n1.x.mul_spec(w.x), n2.x.mul_spec(w.x),
+        n1.y.mul_spec(w.y), n2.y.mul_spec(w.y));
+}
+
+/// Bridge: axis_sep with a canonical-sub model axis ≡ raw vsub axis.
+pub proof fn lemma_axis_sep_canonical_sub_axis(
+    d: Vec2<Rational>,
+    p0: Vec2<Rational>,
+    p1: Vec2<Rational>,
+    base: Vec2<Rational>,
+    q: Vec2<Rational>,
+)
+    requires
+        d.x == p1.x.sub_spec(p0.x).canonical(),
+        d.y == p1.y.sub_spec(p0.y).canonical(),
+    ensures
+        axis_sep(d, base, q).eqv_spec(axis_sep(vsub(p1, p0), base, q)),
+{
+    Rational::lemma_canonical_exists(p1.x.sub_spec(p0.x));
+    Rational::lemma_canonical_exists(p1.y.sub_spec(p0.y));
+    lemma_vdot_congruence_left(d, vsub(p1, p0), vsub(q, base));
+    // axis_sep(n, base, q) == vdot(n, vsub(q, base)) — structural.
+}
+
+/// The full span claim: a point between the two side half-planes of the
+/// reference edge decomposes over the edge basis with t ∈ [0, 1].
+pub proof fn lemma_manifold_point_span(
+    p0: Vec2<Rational>,
+    p1: Vec2<Rational>,
+    q: Vec2<Rational>,
+)
+    requires
+        !vdot(vsub(p1, p0), vsub(p1, p0)).eqv_spec(Rational::from_int_spec(0)),
+        Rational::from_int_spec(0).le_spec(axis_sep(vsub(p1, p0), p0, q)),
+        axis_sep(vsub(p1, p0), p1, q).le_spec(Rational::from_int_spec(0)),
+    ensures
+        crate::narrowphase::on_face_span(p0, p1, edge_normal(p0, p1), q),
+{
+    let zero = Rational::from_int_spec(0);
+    let one = Rational::from_int_spec(1);
+    let d = vsub(p1, p0);
+    let l = vdot(d, d);
+    let delta = vsub(q, p0);
+    let t = vdot(d, delta).div_spec(l);
+    // l > 0 from nonzero + square nonnegativity
+    Rational::lemma_square_le_nonneg(d.x);
+    Rational::lemma_square_le_nonneg(d.y);
+    Rational::lemma_eqv_reflexive(zero);
+    Rational::lemma_le_add_both(
+        zero, d.x.mul_spec(d.x), zero, d.y.mul_spec(d.y));
+    Rational::lemma_add_zero_identity(zero);
+    crate::proofs::shape::lemma_le_eqv_subst_left(zero.add_spec(zero), zero, l);
+    Rational::lemma_trichotomy(zero, l);
+    // t ≥ 0: axis_sep(d, p0, q) == vdot(d, delta) structural
+    assert(axis_sep(d, p0, q) == vdot(d, delta));
+    Rational::lemma_div_le_monotone(zero, vdot(d, delta), l);
+    Rational::lemma_mul_zero(l.reciprocal_spec());
+    assert(zero.div_spec(l) == zero.mul_spec(l.reciprocal_spec()));
+    crate::proofs::shape::lemma_le_eqv_subst_left(zero.div_spec(l), zero, t);
+    // t ≤ 1: vdot(d, delta) ≤ l
+    lemma_axis_sep_between(d, p0, p1, q);
+    assert(axis_sep(d, p0, p1) == l);
+    crate::proofs::shape::lemma_le_eqv_subst_left(
+        axis_sep(d, p1, q), axis_sep(d, p0, q).sub_spec(l), zero);
+    Rational::lemma_le_add_monotone(axis_sep(d, p0, q).sub_spec(l), zero, l);
+    lemma_add_sub_cancel(l, axis_sep(d, p0, q));
+    Rational::lemma_add_commutative(axis_sep(d, p0, q).sub_spec(l), l);
+    Rational::lemma_eqv_transitive(
+        axis_sep(d, p0, q).sub_spec(l).add_spec(l),
+        l.add_spec(axis_sep(d, p0, q).sub_spec(l)),
+        axis_sep(d, p0, q));
+    Rational::lemma_add_zero_identity(l);
+    crate::proofs::shape::lemma_le_eqv_subst_left(
+        axis_sep(d, p0, q).sub_spec(l).add_spec(l), axis_sep(d, p0, q), l);
+    // axis_sep(d, p0, q) == vdot(d, delta) structural
+    Rational::lemma_div_le_monotone(vdot(d, delta), l, l);
+    Rational::lemma_div_self(l);
+    crate::proofs::shape::lemma_le_eqv_subst_right(t, l.div_spec(l), one);
+    // decomposition + assemble
+    lemma_basis_decomposition(p0, p1, q);
+    assert(crate::narrowphase::on_face_span(p0, p1, edge_normal(p0, p1), q));
+}
+
+} // verus!
+
+verus! {
+
+/// Assemble the on_face_span fact for a final manifold point from the
+/// two model-axis clip facts (canonical-sub axis model).
+pub proof fn lemma_manifold_final_span(
+    dm: Vec2<Rational>,
+    p0m: Vec2<Rational>,
+    p1m: Vec2<Rational>,
+    q: Vec2<Rational>,
+)
+    requires
+        dm.x == p1m.x.sub_spec(p0m.x).canonical(),
+        dm.y == p1m.y.sub_spec(p0m.y).canonical(),
+        !vdot(vsub(p1m, p0m), vsub(p1m, p0m)).eqv_spec(Rational::from_int_spec(0)),
+        Rational::from_int_spec(0).le_spec(axis_sep(dm, p0m, q)),
+        Rational::from_int_spec(0).le_spec(axis_sep(dm.neg(), p1m, q)),
+    ensures
+        crate::narrowphase::on_face_span(p0m, p1m, edge_normal(p0m, p1m), q),
+{
+    let zero = Rational::from_int_spec(0);
+    // bridge the model axis to the raw vsub form
+    lemma_axis_sep_canonical_sub_axis(dm, p0m, p1m, p0m, q);
+    crate::proofs::shape::lemma_le_eqv_subst_right(
+        zero, axis_sep(dm, p0m, q), axis_sep(vsub(p1m, p0m), p0m, q));
+    // 0 ≤ axis_sep(−d, p1, q) ≡ −axis_sep(d, p1, q) → axis_sep(d, p1, q) ≤ 0
+    lemma_axis_sep_neg_left(dm, p1m, q);
+    Rational::lemma_neg_reverses_le(zero, axis_sep(dm.neg(), p1m, q));
+    Rational::lemma_eqv_neg_congruence(
+        axis_sep(dm.neg(), p1m, q), axis_sep(dm, p1m, q).neg_spec());
+    assert(axis_sep(dm, p1m, q).neg_spec().neg_spec() == axis_sep(dm, p1m, q));
+    assert(zero.neg_spec() == zero);
+    crate::proofs::shape::lemma_le_eqv_subst_left(
+        axis_sep(dm.neg(), p1m, q).neg_spec(), axis_sep(dm, p1m, q), zero);
+    // bridge the second axis fact
+    lemma_axis_sep_canonical_sub_axis(dm, p0m, p1m, p1m, q);
+    crate::proofs::shape::lemma_le_eqv_subst_left(
+        axis_sep(dm, p1m, q), axis_sep(vsub(p1m, p0m), p1m, q), zero);
+    lemma_manifold_point_span(p0m, p1m, q);
 }
 
 } // verus!

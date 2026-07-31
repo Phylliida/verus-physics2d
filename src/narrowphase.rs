@@ -242,6 +242,36 @@ pub open spec fn interp_rel(
     &&& q.y.eqv_spec(vadd(a, vscale(u, vsub(b, a))).y)
 }
 
+/// q decomposes over the reference-edge basis within the clipped span:
+/// q ≡ p0 + t·(p1 − p0) + s·n with t ∈ [0,1] and s = dot(n, q − p0)/|n|²
+/// (the normal offset; |n|² = |d|² since n is d rotated). This is the
+/// honest reading of SPEC §5's "lies on the reference face line within
+/// the clipped span" — the point itself may sit off the line by s·n,
+/// which is exactly what "sep ≡ exact axis_sep value" requires.
+pub open spec fn on_face_span(
+    p0: Vec2<Rational>,
+    p1: Vec2<Rational>,
+    n: Vec2<Rational>,
+    q: Vec2<Rational>,
+) -> bool {
+    let d = vsub(p1, p0);
+    let l = vdot(d, d);
+    let delta = vsub(q, p0);
+    let t = vdot(d, delta).div_spec(l);
+    let s = vdot(n, delta).div_spec(l);
+    &&& !l.eqv_spec(Rational::from_int_spec(0))
+    &&& Rational::from_int_spec(0).le_spec(t)
+    &&& t.le_spec(Rational::from_int_spec(1))
+    &&& q.x.eqv_spec(vadd(p0, vadd(vscale(t, d), vscale(s, n))).x)
+    &&& q.y.eqv_spec(vadd(p0, vadd(vscale(t, d), vscale(s, n))).y)
+}
+
+/// Lexicographic order on points (E6 canonical manifold order).
+pub open spec fn lex_le(a: Vec2<Rational>, b: Vec2<Rational>) -> bool {
+    ||| a.x.lt_spec(b.x)
+    ||| (a.x.eqv_spec(b.x) && a.y.le_spec(b.y))
+}
+
 /// Incident edge selection (SPEC §5 step 3): the edge of `inc` whose
 /// outward normal has minimal dot with the reference normal (ties: lower
 /// index). Ensures the returned index attains the min.
@@ -796,6 +826,292 @@ pub fn clip_halfplane_exec(
         }
     }
     out
+}
+
+} // verus!
+
+verus! {
+
+/// Clip the incident segment q0–q1 into the span of the reference edge
+/// p0–p1: both side half-planes applied (SPEC §5 step 3). Output: 0–2
+/// points, each inside both side planes.
+pub fn clip_to_ref_span_exec(
+    d: &SVec2,
+    neg_d: &SVec2,
+    p0: &SVec2,
+    p1: &SVec2,
+    q0: &SVec2,
+    q1: &SVec2,
+) -> (out: Vec<SVec2>)
+    requires
+        d.wf_spec(),
+        neg_d.wf_spec(),
+        p0.wf_spec(),
+        p1.wf_spec(),
+        q0.wf_spec(),
+        q1.wf_spec(),
+        neg_d.model@ == d.model@.neg(),
+    ensures
+        out@.len() <= 2,
+        forall|k: int|
+            0 <= k < out@.len() ==> {
+                let q = (#[trigger] out@[k]);
+                &&& q.wf_spec()
+                &&& Rational::from_int_spec(0).le_spec(
+                        axis_sep(d.model@, p0.model@, q.model@))
+                &&& Rational::from_int_spec(0).le_spec(
+                        axis_sep(neg_d.model@, p1.model@, q.model@))
+            },
+{
+    let c1 = clip_halfplane_exec(d, p0, q0, q1);
+    if c1.len() == 0 {
+        return c1;
+    }
+    if c1.len() == 1 {
+        let chk = axis_sep_exec(neg_d, p1, &c1[0]);
+        let zero = RuntimeRational::from_int(0);
+        let mut out: Vec<SVec2> = Vec::new();
+        let keep = zero.le(&chk);
+        if keep {
+            out.push(copy_svec2(&c1[0]));
+            proof {
+                assert(zero@.le_spec(chk@));
+                assert(chk@ == axis_sep(neg_d.model@, p1.model@, c1@[0].model@));
+            }
+        }
+        return out;
+    }
+    let c2 = clip_halfplane_exec(neg_d, p1, &c1[0], &c1[1]);
+    proof {
+        assert forall|k: int|
+            0 <= k < c2@.len() implies Rational::from_int_spec(0).le_spec(
+                axis_sep(d.model@, p0.model@, #[trigger] c2@[k].model@))
+        by {
+            let u2 = choose|u: Rational|
+                interp_rel(c1@[0].model@, c1@[1].model@, c2@[k].model@, u);
+            crate::proofs::manifold::lemma_interp_value_nonneg(
+                d.model@, p0.model@, c1@[0].model@, c1@[1].model@, c2@[k].model@, u2);
+        }
+    }
+    c2
+}
+
+/// Build the contact manifold for a Touching pair (SPEC §5 step 3):
+/// clip the incident segment into the reference edge's span and keep the
+/// points with sep ≤ 0 relative to the reference face. None on
+/// degenerate input (empty clip or all points outside the face).
+pub fn build_manifold(
+    a: usize,
+    b: usize,
+    ref_poly: &ConvexPoly,
+    inc_poly: &ConvexPoly,
+    ref_edge: usize,
+) -> (out: Option<ContactManifold>)
+    requires
+        ref_poly.wf_spec(),
+        inc_poly.wf_spec(),
+        ref_edge < ref_poly.verts@.len(),
+    ensures
+        out is Some ==> {
+            let m = out->Some_0;
+            let rm = ref_poly.model_verts();
+            let e = ref_edge as int;
+            let p0m = rm[e];
+            let p1m = rm[(e + 1) % (rm.len() as int)];
+            &&& m.a == a
+            &&& m.b == b
+            &&& m.feature.0 == ref_edge
+            &&& m.normal.wf_spec()
+            &&& m.normal.model@ == edge_normal(p0m, p1m)
+            &&& !vdot(m.normal.model@, m.normal.model@).eqv_spec(Rational::from_int_spec(0))
+            &&& 1 <= m.points@.len() <= 2
+            &&& forall|k: int|
+                0 <= k < m.points@.len() ==> {
+                    let cp = #[trigger] m.points@[k];
+                    &&& cp.point.wf_spec()
+                    &&& cp.sep.wf_spec()
+                    &&& cp.sep@ == axis_sep(m.normal.model@, p0m, cp.point.model@)
+                    &&& cp.sep@.le_spec(Rational::from_int_spec(0))
+                    &&& on_face_span(p0m, p1m, m.normal.model@, cp.point.model@)
+                }
+            &&& (m.points@.len() == 2 ==> lex_le(
+                    m.points@[0].point.model@, m.points@[1].point.model@))
+        },
+{
+    let nv = ref_poly.verts.len();
+    let p0 = &ref_poly.verts[ref_edge];
+    let p1 = &ref_poly.verts[(ref_edge + 1) % nv];
+    let normal = edge_normal_exec(p0, p1);
+    proof {
+        assert(ref_poly.model_verts()[ref_edge as int] == p0.model@);
+        assert(ref_poly.model_verts()[
+            (ref_edge as int + 1) % (ref_poly.model_verts().len() as int)] == p1.model@);
+        crate::proofs::manifold::lemma_edge_normal_nonzero(
+            ref_poly.model_verts(), ref_edge as int);
+        // |n|² == |d|² structural (n is d rotated)
+        crate::proofs::manifold::lemma_sub_neg_structural(p0.model@.x, p1.model@.x);
+        // |n|² == |d|² structural (n is d rotated), staged
+        assert(normal.model@.x == vsub(p1.model@, p0.model@).y);
+        assert(normal.model@.y == vsub(p1.model@, p0.model@).x.neg_spec());
+        assert(normal.model@.x.mul_spec(normal.model@.x)
+            == vsub(p1.model@, p0.model@).y.mul_spec(vsub(p1.model@, p0.model@).y));
+        assert(normal.model@.y.mul_spec(normal.model@.y)
+            == vsub(p1.model@, p0.model@).x.mul_spec(vsub(p1.model@, p0.model@).x)) by {
+            let dxn = vsub(p1.model@, p0.model@).x;
+            assert(normal.model@.y == dxn.neg_spec());
+            assert(normal.model@.y.mul_spec(normal.model@.y).num
+                == (-dxn.num) * (-dxn.num));
+            assert((-dxn.num) * (-dxn.num) == dxn.num * dxn.num) by (nonlinear_arith);
+            assert(normal.model@.y.mul_spec(normal.model@.y).den
+                == dxn.mul_spec(dxn).den);
+        }
+        // |n|² ≡ |d|² (per-term structural + add commutativity), so the
+        // nonzero transfers to the vsub form used by the span lemmas.
+        assert(vdot(normal.model@, normal.model@)
+            == vsub(p1.model@, p0.model@).y.mul_spec(vsub(p1.model@, p0.model@).y).add_spec(
+                vsub(p1.model@, p0.model@).x.mul_spec(vsub(p1.model@, p0.model@).x)));
+        Rational::lemma_eqv_reflexive(vdot(normal.model@, normal.model@));
+        Rational::lemma_add_commutative(
+            vsub(p1.model@, p0.model@).x.mul_spec(vsub(p1.model@, p0.model@).x),
+            vsub(p1.model@, p0.model@).y.mul_spec(vsub(p1.model@, p0.model@).y));
+        Rational::lemma_eqv_reflexive(
+            vdot(vsub(p1.model@, p0.model@), vsub(p1.model@, p0.model@)));
+        Rational::lemma_eqv_transitive(
+            vdot(normal.model@, normal.model@),
+            vsub(p1.model@, p0.model@).x.mul_spec(vsub(p1.model@, p0.model@).x).add_spec(
+                vsub(p1.model@, p0.model@).y.mul_spec(vsub(p1.model@, p0.model@).y)),
+            vdot(vsub(p1.model@, p0.model@), vsub(p1.model@, p0.model@)));
+        if vdot(vsub(p1.model@, p0.model@), vsub(p1.model@, p0.model@)).eqv_spec(
+            Rational::from_int_spec(0))
+        {
+            Rational::lemma_eqv_symmetric(
+                vdot(normal.model@, normal.model@),
+                vdot(vsub(p1.model@, p0.model@), vsub(p1.model@, p0.model@)));
+            Rational::lemma_eqv_transitive(
+                vdot(normal.model@, normal.model@),
+                vdot(vsub(p1.model@, p0.model@), vsub(p1.model@, p0.model@)),
+                Rational::from_int_spec(0));
+            assert(false);
+        }
+    }
+    let inc_edge = incident_edge_exec(&normal, inc_poly);
+    let ni = inc_poly.verts.len();
+    let q0 = &inc_poly.verts[inc_edge];
+    let q1 = &inc_poly.verts[(inc_edge + 1) % ni];
+    let d = p1.sub(p0);
+    proof {
+        assert(d.model@.x == p1.model@.x.sub_spec(p0.model@.x).canonical());
+        assert(d.model@.y == p1.model@.y.sub_spec(p0.model@.y).canonical());
+    }
+    let neg_d = d.neg();
+    let c2 = clip_to_ref_span_exec(&d, &neg_d, p0, p1, q0, q1);
+    let zero = RuntimeRational::from_int(0);
+    let mut pts: Vec<ContactPoint> = Vec::new();
+    let mut k: usize = 0;
+    while k < c2.len()
+        invariant
+            k <= c2@.len(),
+            zero.wf_spec(),
+            zero@ == Rational::from_int_spec(0),
+            p0.wf_spec(),
+            p1.wf_spec(),
+            normal.wf_spec(),
+            normal.model@ == edge_normal(p0.model@, p1.model@),
+            d.model@.x == p1.model@.x.sub_spec(p0.model@.x).canonical(),
+            d.model@.y == p1.model@.y.sub_spec(p0.model@.y).canonical(),
+            neg_d.model@ == d.model@.neg(),
+            !vdot(vsub(p1.model@, p0.model@), vsub(p1.model@, p0.model@)).eqv_spec(
+                Rational::from_int_spec(0)),
+            forall|j: int|
+                0 <= j < c2@.len() ==> {
+                    let q = (#[trigger] c2@[j]);
+                    &&& q.wf_spec()
+                    &&& Rational::from_int_spec(0).le_spec(
+                            axis_sep(d.model@, p0.model@, q.model@))
+                    &&& Rational::from_int_spec(0).le_spec(
+                            axis_sep(neg_d.model@, p1.model@, q.model@))
+                },
+            pts@.len() <= k,
+            forall|j: int|
+                0 <= j < pts@.len() ==> {
+                    let cp = #[trigger] pts@[j];
+                    &&& cp.point.wf_spec()
+                    &&& cp.sep.wf_spec()
+                    &&& cp.sep@ == axis_sep(normal.model@, p0.model@, cp.point.model@)
+                    &&& cp.sep@.le_spec(Rational::from_int_spec(0))
+                    &&& on_face_span(
+                        p0.model@, p1.model@, normal.model@, cp.point.model@)
+                },
+        decreases c2.len() - k,
+    {
+        let q = &c2[k];
+        let sep = axis_sep_exec(&normal, p0, q);
+        let keep = sep.le(&zero);
+        if keep {
+            proof {
+                crate::proofs::manifold::lemma_manifold_final_span(
+                    d.model@, p0.model@, p1.model@, q.model@);
+            }
+            pts.push(ContactPoint { point: copy_svec2(q), sep });
+        }
+        k = k + 1;
+    }
+    if pts.len() == 0 {
+        return None;
+    }
+    if pts.len() == 2 {
+        let ltx = pts[1].point.x.lt(&pts[0].point.x);
+        let eqx = pts[1].point.x.eq(&pts[0].point.x);
+        let lty = pts[1].point.y.lt(&pts[0].point.y);
+        let sw = ltx || (eqx && lty);
+        let ghost pre_swap = pts@;
+        if sw {
+            let second = pts.pop().unwrap();
+            let first = pts.pop().unwrap();
+            pts.push(second);
+            pts.push(first);
+            proof {
+                assert(pts@[0] == pre_swap[1]);
+                assert(pts@[1] == pre_swap[0]);
+                if ltx {
+                    assert(pts@[0].point.model@.x.lt_spec(pts@[1].point.model@.x));
+                } else {
+                    assert(eqx && lty);
+                    Rational::lemma_lt_implies_le(
+                        pts@[0].point.model@.y, pts@[1].point.model@.y);
+                }
+                assert(lex_le(pts@[0].point.model@, pts@[1].point.model@));
+            }
+        } else {
+            proof {
+                Rational::lemma_trichotomy(
+                    pts@[0].point.model@.x, pts@[1].point.model@.x);
+                if pts@[1].point.model@.x.lt_spec(pts@[0].point.model@.x) {
+                    assert(ltx);
+                    assert(false);
+                }
+                if pts@[0].point.model@.x.eqv_spec(pts@[1].point.model@.x) {
+                    Rational::lemma_trichotomy(
+                        pts@[0].point.model@.y, pts@[1].point.model@.y);
+                    if pts@[1].point.model@.y.lt_spec(pts@[0].point.model@.y) {
+                        assert(lty);
+                        assert(eqx);
+                        assert(false);
+                    }
+                    Rational::lemma_eqv_symmetric(
+                        pts@[0].point.model@.x, pts@[1].point.model@.x);
+                }
+                assert(lex_le(pts@[0].point.model@, pts@[1].point.model@));
+            }
+        }
+    }
+    Some(ContactManifold {
+        a,
+        b,
+        normal,
+        points: pts,
+        feature: (ref_edge, inc_edge),
+    })
 }
 
 } // verus!

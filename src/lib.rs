@@ -53,4 +53,7 @@ pub mod broadphase;
 pub mod row;
 
 #[cfg(verus_keep_ghost)]
+pub mod solver;
+
+#[cfg(verus_keep_ghost)]
 pub mod certificate;

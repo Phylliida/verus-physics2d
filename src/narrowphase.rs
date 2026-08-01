@@ -588,8 +588,10 @@ pub fn sat_classify(a: &ConvexPoly, b: &ConvexPoly) -> (out: SatResult)
                     axis_separates(b.model_verts(), a.model_verts(), edge as int)
                 }
             },
-            SatResult::Touching { .. } => {
-                no_axis_separates(a.model_verts(), b.model_verts())
+            SatResult::Touching { from_a, edge } => {
+                &&& no_axis_separates(a.model_verts(), b.model_verts())
+                &&& (from_a ==> edge < a.verts@.len())
+                &&& (!from_a ==> edge < b.verts@.len())
             },
         },
 {

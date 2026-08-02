@@ -1187,8 +1187,14 @@ pub open spec fn ke_sum(bodies: Seq<Body>, k: int) -> Rational
         if body_dynamic(b) {
             let ke1 = Rational::from_int_spec(1).div_spec(b.inv_mass@).mul_spec(
                 vdot(b.vel.model@, b.vel.model@)).div_spec(Rational::from_int_spec(2));
-            let ke2 = Rational::from_int_spec(1).div_spec(b.inv_inertia@).mul_spec(
-                b.omega@.mul_spec(b.omega@)).div_spec(Rational::from_int_spec(2));
+            // inv_I ≡ 0 (infinite inertia) pins ω ≡ 0 — the angular term
+            // is genuinely zero, so skip the (undefined) 1/inv_I form
+            let ke2 = if b.inv_inertia@.eqv_spec(Rational::from_int_spec(0)) {
+                Rational::from_int_spec(0)
+            } else {
+                Rational::from_int_spec(1).div_spec(b.inv_inertia@).mul_spec(
+                    b.omega@.mul_spec(b.omega@)).div_spec(Rational::from_int_spec(2))
+            };
             prev.add_spec(ke1.add_spec(ke2))
         } else {
             prev
@@ -1318,7 +1324,15 @@ pub fn check_c7_energy(pre: &World, post: &World) -> (ok: bool)
             let vv = pb.vel.x.mul(&pb.vel.x).add(&pb.vel.y.mul(&pb.vel.y));
             let ke1 = one.div(&pb.inv_mass).mul(&vv).div(&two);
             let om2 = pb.omega.mul(&pb.omega);
-            let ke2 = one.div(&pb.inv_inertia).mul(&om2).div(&two);
+            let no_i = pb.inv_inertia.eq(&zero);
+            let ke2 = if no_i {
+                proof {
+                    assert(pb.inv_inertia@.eqv_spec(Rational::from_int_spec(0)));
+                }
+                RuntimeRational::from_int(0)
+            } else {
+                one.div(&pb.inv_inertia).mul(&om2).div(&two)
+            };
             ke = ke.add(&ke1.add(&ke2));
             let gd = pre.gravity.x.mul(&pb.pos.x).add(&pre.gravity.y.mul(&pb.pos.y));
             pe = pe.add(&one.div(&pb.inv_mass).mul(&gd).neg());
@@ -1363,7 +1377,15 @@ pub fn check_c7_energy(pre: &World, post: &World) -> (ok: bool)
             let vv = qb.vel.x.mul(&qb.vel.x).add(&qb.vel.y.mul(&qb.vel.y));
             let ke1 = one.div(&qb.inv_mass).mul(&vv).div(&two);
             let om2 = qb.omega.mul(&qb.omega);
-            let ke2 = one.div(&qb.inv_inertia).mul(&om2).div(&two);
+            let no_i = qb.inv_inertia.eq(&zero);
+            let ke2 = if no_i {
+                proof {
+                    assert(qb.inv_inertia@.eqv_spec(Rational::from_int_spec(0)));
+                }
+                RuntimeRational::from_int(0)
+            } else {
+                one.div(&qb.inv_inertia).mul(&om2).div(&two)
+            };
             ke_post = ke_post.add(&ke1.add(&ke2));
             let gd = post.gravity.x.mul(&qb.pos.x).add(&post.gravity.y.mul(&qb.pos.y));
             pe_post = pe_post.add(&one.div(&qb.inv_mass).mul(&gd).neg());

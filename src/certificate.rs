@@ -483,6 +483,13 @@ pub open spec fn c1_body_step(pre: World, post: World, cert: StepCert, i: int) -
         pb.omega@.add_spec(
             pb.inv_inertia@.mul_spec(impulse_sum_ang(cert.rows@, i, rn as int))).add_spec(
                 snap_delta_ang(cert.snaps@, i, sn as int)))
+    // static bodies are frozen (the pipeline never integrates them) —
+    // this is what makes C4's static-static pair skip sound
+    &&& (!body_dynamic(pb) ==> {
+        &&& veqv(qb.pos.model@, pb.pos.model@)
+        &&& qb.rot.c@.eqv_spec(pb.rot.c@)
+        &&& qb.rot.s@.eqv_spec(pb.rot.s@)
+    })
 }
 
 /// C1 over all bodies.
@@ -621,6 +628,12 @@ pub fn check_c1_body(pre: &World, post: &World, cert: &StepCert, i: usize) -> (o
     let okx = ex.eq(&qb.vel.x);
     let oky = ey.eq(&qb.vel.y);
     let okom = eom.eq(&qb.omega);
+    let okpos = if is_static {
+        qb.pos.x.eq(&pb.pos.x) && qb.pos.y.eq(&pb.pos.y)
+            && qb.rot.c.eq(&pb.rot.c) && qb.rot.s.eq(&pb.rot.s)
+    } else {
+        true
+    };
     proof {
         // static branch: the expected components match vzero() form
         if is_static {
@@ -628,7 +641,7 @@ pub fn check_c1_body(pre: &World, post: &World, cert: &StepCert, i: usize) -> (o
             assert(evy@ == Rational::from_int_spec(0));
         }
     }
-    okx && oky && okom
+    okx && oky && okom && okpos
 }
 
 /// C1 over all bodies (ok == its spec).
@@ -826,6 +839,662 @@ pub fn check_c5_joints(post: &World, tol_j: &Scalar) -> (ok: bool)
         j = j + 1;
     }
     ok
+}
+
+} // verus!
+
+verus! {
+
+// ── phys-06 C4: non-penetration over the whole post world ─────────────
+
+/// C4 for one part pair: the 05d per-pair claim (convexity of both world
+/// polys + strict separation or bounded penetration, exists-EDGE-witness).
+pub closed spec fn c4_parts_pair(
+    post: World,
+    i: int,
+    j: int,
+    pi: int,
+    pj: int,
+    tol_p: Rational,
+) -> bool
+    recommends
+        0 <= i < post.bodies@.len(),
+        0 <= j < post.bodies@.len(),
+        0 <= pi < post.bodies@[i].shape.parts@.len(),
+        0 <= pj < post.bodies@[j].shape.parts@.len(),
+{
+    let bi = post.bodies@[i];
+    let bj = post.bodies@[j];
+    let wa = world_verts(
+        bi.pos.model@, bi.rot.c@, bi.rot.s@, bi.shape.model_parts()[pi]);
+    let wb = world_verts(
+        bj.pos.model@, bj.rot.c@, bj.rot.s@, bj.shape.model_parts()[pj]);
+    &&& convex_poly_inv(wa)
+    &&& convex_poly_inv(wb)
+    &&& c4_single_contact(wa, wb, tol_p)
+}
+
+/// C4 for one body pair: all part pairs, unless both bodies are static
+/// (frozen by C1, so no relative motion is possible — documented skip).
+pub closed spec fn c4_body_pair(post: World, i: int, j: int, tol_p: Rational) -> bool
+    recommends 0 <= i < j < post.bodies@.len()
+{
+    (body_dynamic(post.bodies@[i]) || body_dynamic(post.bodies@[j])) ==> {
+        forall|pi: int, pj: int|
+            (0 <= pi < post.bodies@[i].shape.parts@.len()
+                && 0 <= pj < post.bodies@[j].shape.parts@.len())
+                ==> c4_parts_pair(post, i, j, pi, pj, tol_p)
+    }
+}
+
+/// C4 (non-penetration, re-derived, SPEC §7): the checker runs its own
+/// broadphase over the post world; every candidate pair is separated or
+/// penetrating at most tol_p.
+pub open spec fn c4_step_world(post: World, tol_p: Rational) -> bool {
+    forall|i: int, j: int|
+        (0 <= i < j < post.bodies@.len()) ==> c4_body_pair(post, i, j, tol_p)
+}
+
+/// The 05d poly-pair check, generalized: strict separating witness on
+/// either side, or touching with max-sep ≥ −tol_p (ok == its spec).
+pub fn check_c4_polys(wa: &ConvexPoly, wb: &ConvexPoly, tol_p: &Scalar) -> (ok: bool)
+    requires
+        wa.wf_spec(),
+        wb.wf_spec(),
+        tol_p.wf_spec(),
+    ensures
+        ok == c4_single_contact(wa.model_verts(), wb.model_verts(), tol_p@),
+{
+    let (sep_a, e_a, ms_a) = classify_side(wa, wb);
+    if sep_a.is_some() {
+        proof {
+            let e = sep_a->Some_0;
+            assert(axis_separates(wa.model_verts(), wb.model_verts(), e as int));
+            assert(c4_single_contact(wa.model_verts(), wb.model_verts(), tol_p@));
+        }
+        return true;
+    }
+    let (sep_b, e_b, ms_b) = classify_side(wb, wa);
+    if sep_b.is_some() {
+        proof {
+            let e = sep_b->Some_0;
+            assert(axis_separates(wb.model_verts(), wa.model_verts(), e as int));
+            assert(c4_single_contact(wa.model_verts(), wb.model_verts(), tol_p@));
+        }
+        return true;
+    }
+    // touching: depth check on the global max(ms_a, ms_b)
+    let ntol_p = tol_p.neg();
+    let a_ge_b = ms_a.ge(&ms_b);
+    let depth_ok = if a_ge_b {
+        ntol_p.le(&ms_a)
+    } else {
+        ntol_p.le(&ms_b)
+    };
+    proof {
+        let wva = wa.model_verts();
+        let wvb = wb.model_verts();
+        assert(no_axis_separates(wva, wvb));
+        assert(wva.len() >= 3);
+        assert(wvb.len() >= 3);
+        if depth_ok {
+            crate::proofs::cert::lemma_c4_witness_of_depth(
+                wva, wvb, ms_a@, ms_b@, e_a as int, e_b as int, tol_p@, a_ge_b);
+            assert(c4_single_contact(wva, wvb, tol_p@));
+        } else {
+            crate::proofs::cert::lemma_no_sep_witness_of_all_nonpos(wva, wvb);
+            crate::proofs::cert::lemma_no_sep_witness_of_all_nonpos(wvb, wva);
+            crate::proofs::cert::lemma_c4_no_witness_of_shallow(
+                wva, wvb, ms_a@, ms_b@, tol_p@, a_ge_b);
+            assert(!c4_single_contact(wva, wvb, tol_p@));
+        }
+    }
+    depth_ok
+}
+
+} // verus!
+
+verus! {
+
+/// C4 for one row of the parts grid: body i's part pi against every part
+/// of body j (ok == its spec).
+pub fn check_c4_parts_row(
+    post: &World,
+    i: usize,
+    j: usize,
+    pi: usize,
+    tol_p: &Scalar,
+) -> (ok: bool)
+    requires
+        post.wf_spec(),
+        tol_p.wf_spec(),
+        i < j < post.bodies@.len(),
+        pi < post.bodies@[i as int].shape.parts@.len(),
+    ensures
+        ok == forall|p2: int|
+            0 <= p2 < post.bodies@[j as int].shape.parts@.len()
+                ==> c4_parts_pair(*post, i as int, j as int, pi as int, p2, tol_p@),
+{
+    let mut ok = true;
+    let mut pj: usize = 0;
+    while pj < post.bodies[j].shape.parts.len()
+        invariant
+            pi < post.bodies@[i as int].shape.parts@.len(),
+            pj <= post.bodies@[j as int].shape.parts@.len(),
+            i < j < post.bodies@.len(),
+            post.wf_spec(),
+            tol_p.wf_spec(),
+            ok == forall|p2: int|
+                0 <= p2 < pj as int
+                    ==> c4_parts_pair(*post, i as int, j as int, pi as int, p2, tol_p@),
+        decreases post.bodies@[j as int].shape.parts@.len() - pj as int,
+    {
+        let bi = &post.bodies[i];
+        let bj = &post.bodies[j];
+        let wvi = world_verts_exec(&bi.pos, &bi.rot, &bi.shape.parts[pi]);
+        let wvj = world_verts_exec(&bj.pos, &bj.rot, &bj.shape.parts[pj]);
+        proof {
+            assert(wvi@.map(|_k: int, v: SVec2| v.model@) == world_verts(
+                bi.pos.model@, bi.rot.c@, bi.rot.s@,
+                bi.shape.model_parts()[pi as int]));
+            assert(wvj@.map(|_k: int, v: SVec2| v.model@) == world_verts(
+                bj.pos.model@, bj.rot.c@, bj.rot.s@,
+                bj.shape.model_parts()[pj as int]));
+        }
+        let gi = ConvexPoly::new_checked(wvi);
+        let gj = ConvexPoly::new_checked(wvj);
+        if gi.is_none() || gj.is_none() {
+            proof {
+                reveal(c4_parts_pair);
+                assert(!c4_parts_pair(*post, i as int, j as int, pi as int, pj as int, tol_p@));
+            }
+            return false;
+        }
+        let wa = gi.unwrap();
+        let wb = gj.unwrap();
+        proof {
+            lemma_unit_norm_raw(bi.rot.c@, bi.rot.s@);
+            lemma_unit_norm_raw(bj.rot.c@, bj.rot.s@);
+            lemma_convex_poly_inv_world(
+                bi.pos.model@, bi.rot.c@, bi.rot.s@, bi.shape.model_parts()[pi as int]);
+            lemma_convex_poly_inv_world(
+                bj.pos.model@, bj.rot.c@, bj.rot.s@, bj.shape.model_parts()[pj as int]);
+        }
+        let ok_p = check_c4_polys(&wa, &wb, tol_p);
+        ok = ok && ok_p;
+        proof {
+            reveal(c4_parts_pair);
+            assert(wa.model_verts() == world_verts(
+                bi.pos.model@, bi.rot.c@, bi.rot.s@,
+                bi.shape.model_parts()[pi as int]));
+            assert(wb.model_verts() == world_verts(
+                bj.pos.model@, bj.rot.c@, bj.rot.s@,
+                bj.shape.model_parts()[pj as int]));
+            assert(ok_p == c4_parts_pair(*post, i as int, j as int, pi as int, pj as int, tol_p@));
+        }
+        pj = pj + 1;
+    }
+    ok
+}
+
+/// C4 for one body pair (ok == its spec).
+pub fn check_c4_body_pair(post: &World, i: usize, j: usize, tol_p: &Scalar) -> (ok: bool)
+    requires
+        post.wf_spec(),
+        tol_p.wf_spec(),
+        i < j < post.bodies@.len(),
+    ensures
+        ok == c4_body_pair(*post, i as int, j as int, tol_p@),
+{
+    let zero = RuntimeRational::from_int(0);
+    let si = post.bodies[i].inv_mass.eq(&zero);
+    let sj = post.bodies[j].inv_mass.eq(&zero);
+    proof {
+        assert(si == !body_dynamic(post.bodies@[i as int]));
+        assert(sj == !body_dynamic(post.bodies@[j as int]));
+    }
+    if si && sj {
+        proof {
+            reveal(c4_body_pair);
+        }
+        return true;
+    }
+    let mut ok = true;
+    let mut pi: usize = 0;
+    while pi < post.bodies[i].shape.parts.len()
+        invariant
+            pi <= post.bodies@[i as int].shape.parts@.len(),
+            i < j < post.bodies@.len(),
+            post.wf_spec(),
+            tol_p.wf_spec(),
+            body_dynamic(post.bodies@[i as int]) || body_dynamic(post.bodies@[j as int]),
+            ok == forall|p1: int, p2: int|
+                (0 <= p1 < pi as int && 0 <= p2 < post.bodies@[j as int].shape.parts@.len())
+                    ==> c4_parts_pair(*post, i as int, j as int, p1, p2, tol_p@),
+        decreases post.bodies@[i as int].shape.parts@.len() - pi as int,
+    {
+        let ok_r = check_c4_parts_row(post, i, j, pi, tol_p);
+        ok = ok && ok_r;
+        proof {
+            assert(ok_r == forall|p2: int|
+                0 <= p2 < post.bodies@[j as int].shape.parts@.len()
+                    ==> c4_parts_pair(*post, i as int, j as int, pi as int, p2, tol_p@));
+        }
+        pi = pi + 1;
+    }
+    proof {
+        reveal(c4_body_pair);
+        assert(body_dynamic(post.bodies@[i as int]) || body_dynamic(post.bodies@[j as int]));
+    }
+    ok
+}
+
+/// C4 for one row of the pair grid: body i against every j > i
+/// (ok == its spec).
+pub fn check_c4_row(post: &World, i: usize, tol_p: &Scalar) -> (ok: bool)
+    requires
+        post.wf_spec(),
+        tol_p.wf_spec(),
+        i < post.bodies@.len(),
+    ensures
+        ok == forall|j2: int|
+            i as int + 1 <= j2 < post.bodies@.len()
+                ==> c4_body_pair(*post, i as int, j2, tol_p@),
+{
+    let mut ok = true;
+    let mut j: usize = 0;
+    while j < post.bodies.len()
+        invariant
+            i < post.bodies@.len(),
+            j <= post.bodies@.len(),
+            post.wf_spec(),
+            tol_p.wf_spec(),
+            ok == forall|j2: int|
+                i as int + 1 <= j2 < j as int
+                    ==> c4_body_pair(*post, i as int, j2, tol_p@),
+        decreases post.bodies.len() - j,
+    {
+        if j > i {
+            let ok_p = check_c4_body_pair(post, i, j, tol_p);
+            ok = ok && ok_p;
+            proof {
+                assert(ok_p == c4_body_pair(*post, i as int, j as int, tol_p@));
+            }
+        }
+        proof {
+            assert(ok == forall|j2: int|
+                i as int + 1 <= j2 < j as int + 1
+                    ==> c4_body_pair(*post, i as int, j2, tol_p@));
+        }
+        j = j + 1;
+    }
+    ok
+}
+
+/// C4 over all body pairs (ok == its spec).
+pub fn check_c4_world(post: &World, tol_p: &Scalar) -> (ok: bool)
+    requires
+        post.wf_spec(),
+        tol_p.wf_spec(),
+    ensures
+        ok == c4_step_world(*post, tol_p@),
+{
+    let mut ok = true;
+    let mut i: usize = 0;
+    while i < post.bodies.len()
+        invariant
+            i <= post.bodies@.len(),
+            post.wf_spec(),
+            tol_p.wf_spec(),
+            ok == forall|i2: int, j2: int|
+                (0 <= i2 < i as int && i2 < j2 < post.bodies@.len())
+                    ==> c4_body_pair(*post, i2, j2, tol_p@),
+        decreases post.bodies.len() - i,
+    {
+        let ok_r = check_c4_row(post, i, tol_p);
+        ok = ok && ok_r;
+        proof {
+            assert(ok_r == forall|j2: int|
+                i as int + 1 <= j2 < post.bodies@.len()
+                    ==> c4_body_pair(*post, i as int, j2, tol_p@));
+        }
+        i = i + 1;
+    }
+    ok
+}
+
+} // verus!
+
+verus! {
+
+// ── phys-06 C7: exact energy ledger ───────────────────────────────────
+// KE = Σ_dynamic (1/inv_m)·|v|²/2 + (1/inv_I)·ω²/2,
+// PE = −Σ_dynamic (1/inv_m)·dot(g, pos),
+// W_drift = −Σ_dynamic (1/inv_m)·|g|²·dt²/2  (the exact symplectic-Euler
+// drift — accounted, not an error). Dissipation is nonnegative and
+// exactly computed: E(post) ≤ E(pre) + W_drift + W_proj + W_snaps.
+// No tolerance anywhere (D13 candidate; W_proj/W_snaps vacuous in 06a).
+
+/// KE of the first k bodies (dynamic only).
+pub open spec fn ke_sum(bodies: Seq<Body>, k: int) -> Rational
+    decreases k
+{
+    if k <= 0 {
+        Rational::from_int_spec(0)
+    } else {
+        let prev = ke_sum(bodies, (k - 1) as int);
+        let b = bodies[k - 1];
+        if body_dynamic(b) {
+            let ke1 = Rational::from_int_spec(1).div_spec(b.inv_mass@).mul_spec(
+                vdot(b.vel.model@, b.vel.model@)).div_spec(Rational::from_int_spec(2));
+            let ke2 = Rational::from_int_spec(1).div_spec(b.inv_inertia@).mul_spec(
+                b.omega@.mul_spec(b.omega@)).div_spec(Rational::from_int_spec(2));
+            prev.add_spec(ke1.add_spec(ke2))
+        } else {
+            prev
+        }
+    }
+}
+
+/// PE of the first k bodies under gravity g (dynamic only).
+pub open spec fn pe_sum(bodies: Seq<Body>, g: Vec2<Rational>, k: int) -> Rational
+    decreases k
+{
+    if k <= 0 {
+        Rational::from_int_spec(0)
+    } else {
+        let prev = pe_sum(bodies, g, (k - 1) as int);
+        let b = bodies[k - 1];
+        if body_dynamic(b) {
+            let pe = Rational::from_int_spec(1).div_spec(b.inv_mass@).mul_spec(
+                vdot(g, b.pos.model@)).neg_spec();
+            prev.add_spec(pe)
+        } else {
+            prev
+        }
+    }
+}
+
+/// The exact symplectic drift allowance of the first k bodies.
+pub open spec fn w_drift_sum(
+    bodies: Seq<Body>,
+    g: Vec2<Rational>,
+    dt: Rational,
+    k: int,
+) -> Rational
+    decreases k
+{
+    if k <= 0 {
+        Rational::from_int_spec(0)
+    } else {
+        let prev = w_drift_sum(bodies, g, dt, (k - 1) as int);
+        let b = bodies[k - 1];
+        if body_dynamic(b) {
+            let wd = Rational::from_int_spec(1).div_spec(b.inv_mass@).mul_spec(
+                vdot(g, g)).mul_spec(dt).mul_spec(dt).div_spec(
+                Rational::from_int_spec(2)).neg_spec();
+            prev.add_spec(wd)
+        } else {
+            prev
+        }
+    }
+}
+
+/// Total energy of a world (KE + PE over all bodies).
+pub open spec fn world_energy(bodies: Seq<Body>, g: Vec2<Rational>) -> Rational {
+    ke_sum(bodies, bodies.len() as int).add_spec(pe_sum(bodies, g, bodies.len() as int))
+}
+
+/// C7 (exact energy ledger, SPEC §7): E(post) ≤ E(pre) + W_drift + W_proj
+/// + W_snaps, all terms exactly computed. 06a: W_proj = W_snaps = 0
+/// (no projection yet, no snaps yet).
+pub open spec fn c7_energy_ledger(
+    pre: World,
+    post: World,
+    w_proj: Rational,
+    w_snaps: Rational,
+) -> bool
+    recommends post.bodies@.len() == pre.bodies@.len()
+{
+    let e_pre = world_energy(pre.bodies@, pre.gravity.model@);
+    let e_post = world_energy(post.bodies@, post.gravity.model@);
+    let drift = w_drift_sum(pre.bodies@, pre.gravity.model@, pre.dt@, pre.bodies@.len() as int);
+    e_post.le_spec(e_pre.add_spec(drift).add_spec(w_proj).add_spec(w_snaps))
+}
+
+/// C7 exec: fold KE/PE/drift, compare (ok == its spec).
+pub fn check_c7_energy(pre: &World, post: &World) -> (ok: bool)
+    requires
+        pre.wf_spec(),
+        post.wf_spec(),
+        post.bodies@.len() == pre.bodies@.len(),
+    ensures
+        ok == c7_energy_ledger(*pre, *post, Rational::from_int_spec(0), Rational::from_int_spec(0)),
+{
+    let one = RuntimeRational::from_int(1);
+    let two = RuntimeRational::from_int(2);
+    let mut ke = RuntimeRational::from_int(0);
+    let mut pe = RuntimeRational::from_int(0);
+    let mut drift = RuntimeRational::from_int(0);
+    let mut ke_post = RuntimeRational::from_int(0);
+    let mut pe_post = RuntimeRational::from_int(0);
+    let g2 = pre.gravity.x.mul(&pre.gravity.x).add(&pre.gravity.y.mul(&pre.gravity.y));
+    let mut i: usize = 0;
+    while i < pre.bodies.len()
+        invariant
+            i <= pre.bodies@.len(),
+            pre.wf_spec(),
+            post.wf_spec(),
+            post.bodies@.len() == pre.bodies@.len(),
+            one.wf_spec(),
+            two.wf_spec(),
+            one@ == Rational::from_int_spec(1),
+            two@ == Rational::from_int_spec(2),
+            g2.wf_spec(),
+            g2@ == vdot(pre.gravity.model@, pre.gravity.model@),
+            ke.wf_spec(),
+            pe.wf_spec(),
+            drift.wf_spec(),
+            ke_post.wf_spec(),
+            pe_post.wf_spec(),
+            ke@ == ke_sum(pre.bodies@, i as int),
+            pe@ == pe_sum(pre.bodies@, pre.gravity.model@, i as int),
+            drift@ == w_drift_sum(pre.bodies@, pre.gravity.model@, pre.dt@, i as int),
+            ke_post@ == ke_sum(post.bodies@, i as int),
+            pe_post@ == pe_sum(post.bodies@, post.gravity.model@, i as int),
+        decreases pre.bodies.len() - i,
+    {
+        let zero = RuntimeRational::from_int(0);
+        let is_static = pre.bodies[i].inv_mass.eq(&zero);
+        proof {
+            assert(is_static == !body_dynamic(pre.bodies@[i as int]));
+        }
+        if !is_static {
+            let pb = &pre.bodies[i];
+            proof {
+                Rational::lemma_eqv_zero_iff_num_zero(pb.inv_mass@);
+                Rational::lemma_eqv_zero_iff_num_zero(pb.inv_inertia@);
+            }
+            let vv = pb.vel.x.mul(&pb.vel.x).add(&pb.vel.y.mul(&pb.vel.y));
+            let ke1 = one.div(&pb.inv_mass).mul(&vv).div(&two);
+            let om2 = pb.omega.mul(&pb.omega);
+            let ke2 = one.div(&pb.inv_inertia).mul(&om2).div(&two);
+            ke = ke.add(&ke1.add(&ke2));
+            let gd = pre.gravity.x.mul(&pb.pos.x).add(&pre.gravity.y.mul(&pb.pos.y));
+            pe = pe.add(&one.div(&pb.inv_mass).mul(&gd).neg());
+            let wd = one.div(&pb.inv_mass).mul(&g2).mul(&pre.dt).mul(&pre.dt).div(&two).neg();
+            drift = drift.add(&wd);
+            proof {
+                assert(ke@ == ke_sum(pre.bodies@, (i + 1) as int)) by {
+                    reveal_with_fuel(ke_sum, 2);
+                };
+                assert(pe@ == pe_sum(pre.bodies@, pre.gravity.model@, (i + 1) as int)) by {
+                    reveal_with_fuel(pe_sum, 2);
+                };
+                assert(drift@ == w_drift_sum(
+                    pre.bodies@, pre.gravity.model@, pre.dt@, (i + 1) as int)) by {
+                    reveal_with_fuel(w_drift_sum, 2);
+                };
+            }
+        } else {
+            proof {
+                assert(ke@ == ke_sum(pre.bodies@, (i + 1) as int)) by {
+                    reveal_with_fuel(ke_sum, 2);
+                };
+                assert(pe@ == pe_sum(pre.bodies@, pre.gravity.model@, (i + 1) as int)) by {
+                    reveal_with_fuel(pe_sum, 2);
+                };
+                assert(drift@ == w_drift_sum(
+                    pre.bodies@, pre.gravity.model@, pre.dt@, (i + 1) as int)) by {
+                    reveal_with_fuel(w_drift_sum, 2);
+                };
+            }
+        }
+        let qb = &post.bodies[i];
+        let is_static_q = qb.inv_mass.eq(&zero);
+        proof {
+            assert(is_static_q == !body_dynamic(post.bodies@[i as int]));
+        }
+        if !is_static_q {
+            proof {
+                Rational::lemma_eqv_zero_iff_num_zero(qb.inv_mass@);
+                Rational::lemma_eqv_zero_iff_num_zero(qb.inv_inertia@);
+            }
+            let vv = qb.vel.x.mul(&qb.vel.x).add(&qb.vel.y.mul(&qb.vel.y));
+            let ke1 = one.div(&qb.inv_mass).mul(&vv).div(&two);
+            let om2 = qb.omega.mul(&qb.omega);
+            let ke2 = one.div(&qb.inv_inertia).mul(&om2).div(&two);
+            ke_post = ke_post.add(&ke1.add(&ke2));
+            let gd = post.gravity.x.mul(&qb.pos.x).add(&post.gravity.y.mul(&qb.pos.y));
+            pe_post = pe_post.add(&one.div(&qb.inv_mass).mul(&gd).neg());
+            proof {
+                assert(ke_post@ == ke_sum(post.bodies@, (i + 1) as int)) by {
+                    reveal_with_fuel(ke_sum, 2);
+                };
+                assert(pe_post@ == pe_sum(
+                    post.bodies@, post.gravity.model@, (i + 1) as int)) by {
+                    reveal_with_fuel(pe_sum, 2);
+                };
+            }
+        } else {
+            proof {
+                assert(ke_post@ == ke_sum(post.bodies@, (i + 1) as int)) by {
+                    reveal_with_fuel(ke_sum, 2);
+                };
+                assert(pe_post@ == pe_sum(
+                    post.bodies@, post.gravity.model@, (i + 1) as int)) by {
+                    reveal_with_fuel(pe_sum, 2);
+                };
+            }
+        }
+        i = i + 1;
+    }
+    let e_pre = ke.add(&pe);
+    let e_post = ke_post.add(&pe_post);
+    let zero = RuntimeRational::from_int(0);
+    let allowance = e_pre.add(&drift).add(&zero).add(&zero);
+    proof {
+        assert(e_pre@ == world_energy(pre.bodies@, pre.gravity.model@));
+        assert(e_post@ == world_energy(post.bodies@, post.gravity.model@));
+        assert(zero@ == Rational::from_int_spec(0));
+        Rational::lemma_add_zero_identity(e_pre@.add_spec(drift@));
+        Rational::lemma_add_zero_identity(e_pre@.add_spec(drift@).add_spec(zero@));
+    }
+    e_post.le(&allowance)
+}
+
+// ── phys-06: the full step checker ─────────────────────────────────────
+
+/// All step checks (SPEC §7): C1 velocity bookkeeping, C2 bounds, C3
+/// restitution, C4 non-penetration, C5 joint drift, C7 energy ledger.
+/// (C6 ledgers lands in 06c.)
+pub open spec fn step_checks_pass(
+    pre: World,
+    post: World,
+    cert: StepCert,
+    tol_v: Rational,
+    tol_p: Rational,
+    tol_j: Rational,
+) -> bool
+    recommends
+        post.bodies@.len() == pre.bodies@.len(),
+        forall|k: int|
+            0 <= k < cert.rows@.len() ==> {
+                &&& (#[trigger] cert.rows@[k]).a < post.bodies@.len()
+                &&& cert.rows@[k].b < post.bodies@.len()
+            },
+{
+    &&& c1_step_bookkeeping(pre, post, cert)
+    &&& c2_step_bounds(cert.rows@)
+    &&& c3_step_restitution(post, cert.rows@, tol_v)
+    &&& c4_step_world(post, tol_p)
+    &&& c5_step_joints(post, tol_j)
+    &&& c7_energy_ledger(pre, post, Rational::from_int_spec(0), Rational::from_int_spec(0))
+}
+
+/// The semantic claim (ok ⟹ this). C4's semantic content is the
+/// separation/depth claim; the convexity conjuncts are checker-side
+/// gates needed for the bidirectional direction (mirror of 05d).
+pub open spec fn step_certified(
+    pre: World,
+    post: World,
+    cert: StepCert,
+    tol_v: Rational,
+    tol_p: Rational,
+    tol_j: Rational,
+) -> bool
+    recommends
+        post.bodies@.len() == pre.bodies@.len(),
+        forall|k: int|
+            0 <= k < cert.rows@.len() ==> {
+                &&& (#[trigger] cert.rows@[k]).a < post.bodies@.len()
+                &&& cert.rows@[k].b < post.bodies@.len()
+            },
+{
+    &&& c1_step_bookkeeping(pre, post, cert)
+    &&& c2_step_bounds(cert.rows@)
+    &&& c3_step_restitution(post, cert.rows@, tol_v)
+    &&& c4_step_world(post, tol_p)
+    &&& c5_step_joints(post, tol_j)
+    &&& c7_energy_ledger(pre, post, Rational::from_int_spec(0), Rational::from_int_spec(0))
+}
+
+/// The proven checker (SPEC §7, D8): ok == the checks pass, and ok ⟹ the
+/// step is certified. This is the ONLY thing the engine's headline claims
+/// rest on.
+pub fn check_step(
+    pre: &World,
+    post: &World,
+    cert: &StepCert,
+    tol_v: &Scalar,
+    tol_p: &Scalar,
+    tol_j: &Scalar,
+) -> (ok: bool)
+    requires
+        pre.wf_spec(),
+        post.wf_spec(),
+        tol_v.wf_spec(),
+        tol_p.wf_spec(),
+        tol_j.wf_spec(),
+        post.bodies@.len() == pre.bodies@.len(),
+        forall|k: int| 0 <= k < cert.rows@.len() ==> (#[trigger] cert.rows@[k]).wf_spec(),
+        forall|k: int| 0 <= k < cert.snaps@.len() ==> (#[trigger] cert.snaps@[k]).wf_spec(),
+        forall|k: int|
+            0 <= k < cert.rows@.len() ==> {
+                &&& (#[trigger] cert.rows@[k]).a < post.bodies@.len()
+                &&& cert.rows@[k].b < post.bodies@.len()
+            },
+    ensures
+        ok == step_checks_pass(*pre, *post, *cert, tol_v@, tol_p@, tol_j@),
+        ok ==> step_certified(*pre, *post, *cert, tol_v@, tol_p@, tol_j@),
+{
+    let c1 = check_c1_rows(pre, post, cert);
+    let c2 = check_c2_rows(cert);
+    let c3 = check_c3_rows(post, cert, tol_v);
+    let c4 = check_c4_world(post, tol_p);
+    let c5 = check_c5_joints(post, tol_j);
+    let c7 = check_c7_energy(pre, post);
+    c1 && c2 && c3 && c4 && c5 && c7
 }
 
 } // verus!

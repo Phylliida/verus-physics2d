@@ -19,8 +19,10 @@ use crate::angle_ledger::{
     arctan_term, arctan_term_exec, t_in_symmetric_unit_interval, t_in_unit_interval, two_x,
 };
 use crate::body::Body;
-use crate::certificate::StepCert;
+use crate::certificate::{veqv, StepCert};
 use crate::joints::Joint;
+use crate::massprops::vscale;
+use crate::shape::vadd;
 use crate::proofs::rational_raw::{
     compose_c, compose_s, lemma_raw_add_nonneg, lemma_raw_add_zero_right, lemma_raw_abs_nonneg,
     lemma_raw_neg_mul_left, lemma_raw_neg_mul_neg, lemma_raw_neg_mul_right, lemma_raw_two_nonneg,
@@ -664,6 +666,510 @@ pub fn step_free_flight(w: &World) -> (out: StepResult)
         angle_entries,
     };
     StepResult::Ok(w2, cert)
+}
+
+} // verus!
+
+verus! {
+
+// ── phys-06: the full step pipeline (SPEC §6) ─────────────────────────
+// Untrusted except ensures (D8): gravity → rows → PGS → canonicalize →
+// integrate → canonicalize → certify. The checker is the claim.
+
+/// Gravity pass (pipeline step 1): v += g·dt per dynamic body; statics
+/// untouched. Everything else preserved (positions, rotations, shapes).
+pub fn apply_gravity_exec(w: &World) -> (out: Vec<Body>)
+    requires
+        w.wf_spec(),
+    ensures
+        out@.len() == w.bodies@.len(),
+        forall|i: int|
+            0 <= i < w.bodies@.len() ==> {
+                let b = #[trigger] out@[i];
+                &&& b.wf_spec()
+                &&& b.pos.model@ == w.bodies@[i].pos.model@
+                &&& b.rot.c@ == w.bodies@[i].rot.c@
+                &&& b.rot.s@ == w.bodies@[i].rot.s@
+                &&& b.omega@ == w.bodies@[i].omega@
+                &&& b.inv_mass@ == w.bodies@[i].inv_mass@
+                &&& b.inv_inertia@ == w.bodies@[i].inv_inertia@
+                &&& b.shape.model_parts() == w.bodies@[i].shape.model_parts()
+                &&& (body_dynamic(w.bodies@[i]) ==> veqv(
+                        b.vel.model@,
+                        vadd(w.bodies@[i].vel.model@,
+                            vscale(w.dt@, w.gravity.model@))))
+                &&& (!body_dynamic(w.bodies@[i]) ==> veqv(
+                        b.vel.model@, w.bodies@[i].vel.model@))
+            },
+{
+    let mut out: Vec<Body> = Vec::new();
+    let mut i: usize = 0;
+    while i < w.bodies.len()
+        invariant
+            i <= w.bodies@.len(),
+            w.wf_spec(),
+            out@.len() == i as int,
+            forall|j: int|
+                0 <= j < i as int ==> {
+                    let b = #[trigger] out@[j];
+                    &&& b.wf_spec()
+                    &&& b.pos.model@ == w.bodies@[j].pos.model@
+                    &&& b.rot.c@ == w.bodies@[j].rot.c@
+                    &&& b.rot.s@ == w.bodies@[j].rot.s@
+                    &&& b.omega@ == w.bodies@[j].omega@
+                    &&& b.inv_mass@ == w.bodies@[j].inv_mass@
+                    &&& b.inv_inertia@ == w.bodies@[j].inv_inertia@
+                    &&& b.shape.model_parts() == w.bodies@[j].shape.model_parts()
+                    &&& (body_dynamic(w.bodies@[j]) ==> veqv(
+                            b.vel.model@,
+                            vadd(w.bodies@[j].vel.model@,
+                                vscale(w.dt@, w.gravity.model@))))
+                    &&& (!body_dynamic(w.bodies@[j]) ==> veqv(
+                            b.vel.model@, w.bodies@[j].vel.model@))
+                },
+        decreases w.bodies.len() - i,
+    {
+        let zero = RuntimeRational::from_int(0);
+        let is_static = w.bodies[i].inv_mass.eq(&zero);
+        proof {
+            assert(w.bodies@[i as int].inv_mass@.eqv_spec(Rational::from_int_spec(0))
+                == (w.bodies@[i as int].inv_mass@.num == 0));
+            assert(is_static == !body_dynamic(w.bodies@[i as int]));
+        }
+        if is_static {
+            out.push(w.bodies[i].copy_body());
+        } else {
+            let nvx = w.bodies[i].vel.x.add(&w.gravity.x.mul(&w.dt));
+            let nvy = w.bodies[i].vel.y.add(&w.gravity.y.mul(&w.dt));
+            let b2 = Body {
+                pos: copy_svec2(&w.bodies[i].pos),
+                rot: w.bodies[i].rot.copy(),
+                vel: SVec2::new(nvx, nvy),
+                omega: verus_rational::runtime_rational::copy_rational(&w.bodies[i].omega),
+                inv_mass: verus_rational::runtime_rational::copy_rational(&w.bodies[i].inv_mass),
+                inv_inertia: verus_rational::runtime_rational::copy_rational(
+                    &w.bodies[i].inv_inertia),
+                shape: w.bodies[i].shape.copy_compound(),
+            };
+            proof {
+                assert(b2.vel.model@ == vadd(
+                    w.bodies@[i as int].vel.model@,
+                    vscale(w.dt@, w.gravity.model@)));
+                Rational::lemma_eqv_reflexive(b2.vel.model@.x);
+                Rational::lemma_eqv_reflexive(b2.vel.model@.y);
+            }
+            out.push(b2);
+        }
+        i = i + 1;
+    }
+    out
+}
+
+/// Canonicalize pass (D10, exec feasibility — see memory/exec-feasibility):
+/// normalize every body's velocity/position/rotation/omega witnesses in
+/// place. Value-preserving (eqv), no ledger entry.
+pub fn canonicalize_bodies_exec(bodies: &mut Vec<Body>)
+    requires
+        forall|i: int| 0 <= i < old(bodies)@.len() ==> (#[trigger] old(bodies)@[i]).wf_spec(),
+    ensures
+        bodies@.len() == old(bodies)@.len(),
+        forall|i: int|
+            0 <= i < bodies@.len() ==> (#[trigger] bodies@[i]).wf_spec(),
+{
+    let mut i: usize = 0;
+    while i < bodies.len()
+        invariant
+            i <= bodies@.len(),
+            bodies@.len() == old(bodies)@.len(),
+            forall|j: int| 0 <= j < bodies@.len() ==> (#[trigger] bodies@[j]).wf_spec(),
+        decreases bodies.len() - i,
+    {
+        let b = &bodies[i];
+        let b2 = Body {
+            pos: SVec2::new(b.pos.x.normalize(), b.pos.y.normalize()),
+            rot: RotQ {
+                c: b.rot.c.normalize(),
+                s: b.rot.s.normalize(),
+            },
+            vel: SVec2::new(b.vel.x.normalize(), b.vel.y.normalize()),
+            omega: b.omega.normalize(),
+            inv_mass: verus_rational::runtime_rational::copy_rational(&b.inv_mass),
+            inv_inertia: verus_rational::runtime_rational::copy_rational(&b.inv_inertia),
+            shape: b.shape.copy_compound(),
+        };
+        proof {
+            // normalize is value-preserving (eqv), and every body wf
+            // predicate is eqv-respecting
+            let ghost ob = bodies@[i as int];
+            assert(b2.pos.model@.x.eqv_spec(ob.pos.model@.x));
+            assert(b2.pos.model@.y.eqv_spec(ob.pos.model@.y));
+            assert(b2.rot.c@.eqv_spec(ob.rot.c@));
+            assert(b2.rot.s@.eqv_spec(ob.rot.s@));
+            assert(b2.vel.model@.x.eqv_spec(ob.vel.model@.x));
+            assert(b2.vel.model@.y.eqv_spec(ob.vel.model@.y));
+            assert(b2.omega@.eqv_spec(ob.omega@));
+            assert(b2.inv_mass@ == ob.inv_mass@);
+            assert(b2.inv_inertia@ == ob.inv_inertia@);
+            // unit_norm is eqv-respecting (q_eqv form), bridged by
+            // lemma_unit_norm_raw (unit_norm == unit_norm_raw)
+            crate::proofs::rational_raw::lemma_unit_norm_raw(ob.rot.c@, ob.rot.s@);
+            assert(b2.rot.c@.mul_spec(b2.rot.c@).add_spec(b2.rot.s@.mul_spec(b2.rot.s@))
+                .eqv_spec(Rational::from_int_spec(1))) by {
+                Rational::lemma_eqv_reflexive(b2.rot.c@);
+                Rational::lemma_eqv_reflexive(b2.rot.s@);
+                Rational::lemma_eqv_mul_congruence(b2.rot.c@, ob.rot.c@, b2.rot.c@, ob.rot.c@);
+                Rational::lemma_eqv_mul_congruence(b2.rot.s@, ob.rot.s@, b2.rot.s@, ob.rot.s@);
+                Rational::lemma_eqv_add_congruence(
+                    b2.rot.c@.mul_spec(b2.rot.c@), ob.rot.c@.mul_spec(ob.rot.c@),
+                    b2.rot.s@.mul_spec(b2.rot.s@), ob.rot.s@.mul_spec(ob.rot.s@));
+                Rational::lemma_eqv_transitive(
+                    b2.rot.c@.mul_spec(b2.rot.c@).add_spec(b2.rot.s@.mul_spec(b2.rot.s@)),
+                    ob.rot.c@.mul_spec(ob.rot.c@).add_spec(ob.rot.s@.mul_spec(ob.rot.s@)),
+                    Rational::from_int_spec(1));
+            };
+            crate::proofs::rational_raw::lemma_unit_norm_raw(b2.rot.c@, b2.rot.s@);
+            assert(b2.wf_spec());
+        }
+        bodies.set(i, b2);
+        i = i + 1;
+    }
+}
+
+} // verus!
+
+verus! {
+
+/// Integration pass (pipeline step 6): symplectic position update +
+/// tan-half rotation compose + ledger accumulation over pre-computed
+/// (gravity-applied, contact-solved) bodies. Reject = tan-half parameter
+/// outside [−1, 1]. Thin ensures (D8): wf, lengths, per-body tan
+/// interval, ledger-entry equivalence — the certificate is the claim.
+pub fn integrate_exec(
+    w: &World,
+    bodies: Vec<Body>,
+) -> (out: Result<(Vec<Body>, Vec<Scalar>, Vec<Scalar>, Vec<Scalar>), usize>)
+    requires
+        w.wf_spec(),
+        bodies@.len() == w.bodies@.len(),
+        forall|i: int| 0 <= i < bodies@.len() ==> (#[trigger] bodies@[i]).wf_spec(),
+    ensures
+        out is Ok ==> {
+            let (nb, errs, ts, entries) = out->Ok_0;
+            &&& nb@.len() == w.bodies@.len()
+            &&& errs@.len() == w.bodies@.len()
+            &&& ts@.len() == w.bodies@.len()
+            &&& entries@.len() == w.bodies@.len()
+            &&& forall|i: int|
+                0 <= i < w.bodies@.len() ==> {
+                    let ti = #[trigger] ts@[i];
+                    &&& ti.wf_spec()
+                    &&& t_in_symmetric_unit_interval(ti@)
+                    &&& nb@[i].wf_spec()
+                    &&& errs@[i].wf_spec()
+                    &&& q_nonneg(errs@[i]@)
+                    &&& errs@[i]@.eqv_spec(
+                        w.angle_err@[i]@.add_spec(ledger_increment(ti@, w.series_k as nat)))
+                    &&& entries@[i].wf_spec()
+                    &&& entries@[i]@.eqv_spec(ledger_increment(ti@, w.series_k as nat))
+                }
+        },
+{
+    let mut new_bodies: Vec<Body> = Vec::new();
+    let mut new_errs: Vec<Scalar> = Vec::new();
+    let mut ts: Vec<Scalar> = Vec::new();
+    let mut angle_entries: Vec<Scalar> = Vec::new();
+    let mut i: usize = 0;
+    while i < bodies.len()
+        invariant
+            i <= bodies@.len(),
+            w.wf_spec(),
+            bodies@.len() == w.bodies@.len(),
+            forall|bi: int| 0 <= bi < bodies@.len() ==> (#[trigger] bodies@[bi]).wf_spec(),
+            new_bodies@.len() == i as int,
+            new_errs@.len() == i as int,
+            ts@.len() == i as int,
+            angle_entries@.len() == i as int,
+            forall|j: int|
+                0 <= j < i as int ==> {
+                    let tj = #[trigger] ts@[j];
+                    &&& tj.wf_spec()
+                    &&& t_in_symmetric_unit_interval(tj@)
+                    &&& new_bodies@[j].wf_spec()
+                    &&& new_errs@[j].wf_spec()
+                    &&& q_nonneg(new_errs@[j]@)
+                    &&& new_errs@[j]@.eqv_spec(
+                        w.angle_err@[j]@.add_spec(ledger_increment(tj@, w.series_k as nat)))
+                    &&& angle_entries@[j].wf_spec()
+                    &&& angle_entries@[j]@.eqv_spec(ledger_increment(tj@, w.series_k as nat))
+                },
+        decreases bodies.len() - i,
+    {
+        let zero = RuntimeRational::from_int(0);
+        let is_static = bodies[i].inv_mass.eq(&zero);
+        proof {
+            assert(bodies@[i as int].inv_mass@.eqv_spec(Rational::from_int_spec(0))
+                == (bodies@[i as int].inv_mass@.num == 0));
+            assert(is_static == (bodies@[i as int].inv_mass@.num == 0));
+        }
+        if is_static {
+            let b2 = bodies[i].copy_body();
+            let e2 = verus_rational::runtime_rational::copy_rational(&w.angle_err[i]);
+            let t2 = RuntimeRational::from_int(0);
+            proof {
+                let ghost old_e = w.angle_err@[i as int]@;
+                let ghost inc = ledger_increment(t2@, w.series_k as nat);
+                let ghost z = Rational::from_int_spec(0);
+                assert(t2@ == z);
+                assert(t2@.num == 0);
+                lemma_ledger_increment_zero(t2@, w.series_k as nat);
+                Rational::lemma_eqv_reflexive(old_e);
+                Rational::lemma_eqv_add_congruence(old_e, old_e, inc, z);
+                lemma_raw_add_zero_right(old_e);
+                Rational::lemma_eqv_symmetric(old_e.add_spec(z), old_e);
+                Rational::lemma_eqv_transitive(old_e.add_spec(inc), old_e.add_spec(z), old_e);
+                Rational::lemma_eqv_symmetric(old_e.add_spec(inc), old_e);
+                assert(Rational::from_int_spec(-1).le_spec(t2@));
+                assert(t2@.le_spec(Rational::from_int_spec(1)));
+            }
+            new_bodies.push(b2);
+            new_errs.push(e2);
+            ts.push(t2);
+            let e_inc = RuntimeRational::from_int(0);
+            proof {
+                let ghost inc = ledger_increment(t2@, w.series_k as nat);
+                let ghost z = Rational::from_int_spec(0);
+                lemma_ledger_increment_zero(t2@, w.series_k as nat);
+                Rational::lemma_eqv_reflexive(z);
+                Rational::lemma_eqv_symmetric(inc, z);
+                Rational::lemma_eqv_transitive(e_inc@, z, inc);
+            }
+            angle_entries.push(e_inc);
+        } else {
+            let dp = bodies[i].vel.scaled(&w.dt);
+            let pos1 = bodies[i].pos.add(&dp);
+            let vel1 = copy_svec2(&bodies[i].vel);
+            let h = bodies[i].omega.mul(&w.dt);
+            let two = RuntimeRational::from_int(2);
+            proof {
+                assert(!two@.eqv_spec(Rational::from_int_spec(0)));
+            }
+            let half = h.div(&two);
+            let t = RotQ::tan_half_series(&half);
+            let one = RuntimeRational::from_int(1);
+            let minus_one = RuntimeRational::from_int(-1);
+            let t_ok = minus_one.le(&t) && t.le(&one);
+            if !t_ok {
+                return Result::Err(i);
+            }
+            let dr = RotQ::from_tan_half(&t);
+            let rot1 = bodies[i].rot.compose(&dr);
+            let omega1 = verus_rational::runtime_rational::copy_rational(&bodies[i].omega);
+            let im1 = verus_rational::runtime_rational::copy_rational(&bodies[i].inv_mass);
+            let ii1 = verus_rational::runtime_rational::copy_rational(&bodies[i].inv_inertia);
+            let shape1 = bodies[i].shape.copy_compound();
+            let b2 = Body {
+                pos: pos1,
+                rot: rot1,
+                vel: vel1,
+                omega: omega1,
+                inv_mass: im1,
+                inv_inertia: ii1,
+                shape: shape1,
+            };
+            // ledger: 2·|term_{k+1}(t)|
+            let term = arctan_term_exec(&t, w.series_k + 1);
+            let sgn = term.signum();
+            let abs_term = if sgn < 0i8 {
+                term.neg()
+            } else {
+                term
+            };
+            let width = two.mul(&abs_term);
+            let e2 = w.angle_err[i].add(&width).normalize();
+            proof {
+                Rational::lemma_signum_negative_iff(term@);
+                Rational::lemma_signum_zero_iff(term@);
+                Rational::lemma_signum_positive_iff(term@);
+                if sgn < 0i8 {
+                    assert(term@.signum() == -1);
+                    assert(term@.num < 0);
+                    assert(term@.abs_spec() == term@.neg_spec());
+                } else {
+                    assert(term@.signum() == 0 || term@.signum() == 1);
+                    assert(term@.num >= 0);
+                    assert(term@.abs_spec() == term@);
+                }
+                assert(abs_term@ == term@.abs_spec());
+                assert(width@ == ledger_increment(t@, w.series_k as nat));
+                lemma_ledger_increment_nonneg(t@, w.series_k as nat);
+                lemma_raw_add_nonneg(
+                    w.angle_err@[i as int]@, ledger_increment(t@, w.series_k as nat));
+                // e2 ≡ old + width (normalize is value-preserving)
+                assert(e2@.eqv_spec(
+                    w.angle_err@[i as int]@.add_spec(ledger_increment(t@, w.series_k as nat))));
+                // e2 ≥ 0 (eqv to a nonneg value)
+                crate::proofs::shape::lemma_le_eqv_subst_right(
+                    Rational::from_int_spec(0),
+                    w.angle_err@[i as int]@.add_spec(ledger_increment(t@, w.series_k as nat)),
+                    e2@);
+            }
+            new_bodies.push(b2);
+            new_errs.push(e2);
+            ts.push(t);
+            proof {
+                Rational::lemma_eqv_reflexive(ledger_increment(t@, w.series_k as nat));
+            }
+            angle_entries.push(width);
+        }
+        i = i + 1;
+    }
+    Result::Ok((new_bodies, new_errs, ts, angle_entries))
+}
+
+/// The full engine step (SPEC §6): gravity → joint rows (none, phys-07)
+/// → rows → PGS → canonicalize → integrate → canonicalize → certify.
+/// Ok carries the post world and the StepCert the checker accepted;
+/// Reject = angle out of range or certificate failure (D8: never a
+/// wrong accept).
+pub fn step(w: &World, tol_v: &Scalar, tol_p: &Scalar, tol_j: &Scalar) -> (r: StepResult)
+    requires
+        w.wf_spec(),
+        tol_v.wf_spec(),
+        tol_p.wf_spec(),
+        tol_j.wf_spec(),
+        forall|i: int| 0 <= i < w.bodies@.len() ==> (#[trigger] w.bodies@[i]).shape.parts@.len()
+            >= 1,
+    ensures
+        r is Ok ==> {
+            &&& r->Ok_0.wf_spec()
+            &&& crate::certificate::step_checks_pass(*w, r->Ok_0, r->Ok_1, tol_v@, tol_p@, tol_j@)
+            &&& crate::certificate::step_certified(*w, r->Ok_0, r->Ok_1, tol_v@, tol_p@, tol_j@)
+        },
+{
+    // 1. gravity
+    let gb = apply_gravity_exec(w);
+    proof {
+        // parts-len bridge: model_parts() == parts@.map(...) preserves len
+        assert forall|bi: int|
+            0 <= bi < gb@.len() implies (#[trigger] gb@[bi]).shape.parts@.len() >= 1
+        by {
+            assert(gb@[bi].shape.model_parts() == w.bodies@[bi].shape.model_parts());
+            assert(gb@[bi].shape.model_parts().len() == gb@[bi].shape.parts@.len());
+        }
+    }
+    // 2. joint rows — none in phys-06 (w.joints iterated but empty of rows)
+    // 3. broadphase → narrowphase → manifolds → rows
+    let mut aabbs: Vec<crate::broadphase::Aabb> = Vec::new();
+    let mut ai: usize = 0;
+    while ai < gb.len()
+        invariant
+            ai <= gb@.len(),
+            aabbs@.len() == ai as int,
+            forall|bi: int| 0 <= bi < gb@.len() ==> (#[trigger] gb@[bi]).wf_spec(),
+            forall|bi: int| 0 <= bi < gb@.len() ==> (#[trigger] gb@[bi]).shape.parts@.len() >= 1,
+            forall|k: int| 0 <= k < aabbs@.len() ==> (#[trigger] aabbs@[k]).wf_spec(),
+        decreases gb.len() - ai,
+    {
+        aabbs.push(crate::solver::body_aabb_exec(&gb[ai]));
+        ai = ai + 1;
+    }
+    let (rows, meffs) = crate::solver::build_rows_exec(&gb, &aabbs);
+    proof {
+        // meffs-wf trigger bridge (build_rows states it inside the rows-forall)
+        assert forall|k: int| 0 <= k < meffs@.len() implies (#[trigger] meffs@[k]).wf_spec()
+        by {
+            let r = rows@[k];
+        }
+    }
+    // 4. PGS velocity solve
+    let (pb, prows) = crate::solver::pgs_sweep_exec(&gb, &rows, &meffs, 16);
+    // 5. canonicalize (D10, exec feasibility)
+    let mut pb2 = pb;
+    canonicalize_bodies_exec(&mut pb2);
+    // 6. integrate
+    let integ = integrate_exec(w, pb2);
+    match integ {
+        Result::Err(idx) => StepResult::Reject(RejectReason::AngleOutOfRange(idx)),
+        Result::Ok((nb, errs, ts, entries)) => {
+            let mut nb2 = nb;
+            proof {
+                assert forall|bi: int| 0 <= bi < nb2@.len() implies (#[trigger] nb2@[bi]).wf_spec()
+                by {
+                    let tj = ts@[bi];
+                }
+            }
+            canonicalize_bodies_exec(&mut nb2);
+            // 7./8. projection + position snap are 06b/06c
+            let gravity2 = copy_svec2(&w.gravity);
+            let dt2 = verus_rational::runtime_rational::copy_rational(&w.dt);
+            let mut joints2: Vec<Joint> = Vec::new();
+            let mut j: usize = 0;
+            while j < w.joints.len()
+                invariant
+                    j <= w.joints@.len(),
+                    w.wf_spec(),
+                    joints2@.len() == j as int,
+                    forall|k: int|
+                        0 <= k < j as int ==> {
+                            let jj = #[trigger] joints2@[k];
+                            &&& jj.wf_spec()
+                            &&& jj.a == w.joints@[k].a
+                            &&& jj.b == w.joints@[k].b
+                            &&& jj.anchor_a.model@ == w.joints@[k].anchor_a.model@
+                            &&& jj.anchor_b.model@ == w.joints@[k].anchor_b.model@
+                        },
+                decreases w.joints.len() - j,
+            {
+                joints2.push(w.joints[j].copy_joint());
+                j = j + 1;
+            }
+            let post = World {
+                bodies: nb2,
+                joints: joints2,
+                gravity: gravity2,
+                dt: dt2,
+                series_k: w.series_k,
+                angle_err: errs,
+            };
+            proof {
+                assert(q_pos(post.dt@));
+                assert forall|k: int|
+                    0 <= k < post.joints@.len() implies {
+                        let jj = #[trigger] post.joints@[k];
+                        &&& jj.wf_spec()
+                        &&& (jj.a as int) < post.bodies@.len()
+                        &&& (jj.b as int) < post.bodies@.len()
+                    }
+                by {
+                    let jj = post.joints@[k];
+                    assert(jj.wf_spec());
+                    assert((jj.a as int) < w.bodies@.len());
+                }
+                assert forall|k: int|
+                    0 <= k < post.angle_err@.len() implies {
+                        let e = #[trigger] post.angle_err@[k];
+                        e.wf_spec() && q_nonneg(e@)
+                    }
+                by {
+                    let tj = ts@[k];
+                }
+                assert(post.wf_spec());
+            }
+            let cert = StepCert {
+                rows: prows,
+                tan_halfs: ts,
+                snaps: Vec::new(),
+                angle_entries: entries,
+            };
+            // 9. certify
+            let ok = crate::certificate::check_step(w, &post, &cert, tol_v, tol_p, tol_j);
+            if ok {
+                StepResult::Ok(post, cert)
+            } else {
+                StepResult::Reject(RejectReason::CertFailed)
+            }
+        },
+    }
 }
 
 } // verus!

@@ -1026,6 +1026,53 @@ pub fn integrate_exec(
     Result::Ok((new_bodies, new_errs, ts, angle_entries))
 }
 
+/// The full engine step with the certificate result exposed (SPEC §6):
+/// gravity → joint rows (none, phys-07) → rows → PGS → canonicalize →
+/// integrate → canonicalize → certify. Always returns the post world and
+/// cert (Ok of the Result) — the boolean is EXACTLY step_checks_pass,
+/// so acceptance scenes can prove `ok == true` on the returned values.
+/// Err = angle out of range (the |t| ≤ 1 phase-1 restriction).
+pub fn step_checked(
+    w: &World,
+    tol_v: &Scalar,
+    tol_p: &Scalar,
+    tol_j: &Scalar,
+) -> (out: Result<(World, StepCert, bool), usize>)
+    requires
+        w.wf_spec(),
+        tol_v.wf_spec(),
+        tol_p.wf_spec(),
+        tol_j.wf_spec(),
+        forall|i: int| 0 <= i < w.bodies@.len() ==> (#[trigger] w.bodies@[i]).shape.parts@.len()
+            >= 1,
+    ensures
+        out is Ok ==> {
+            let (post, cert, ok) = out->Ok_0;
+            &&& post.wf_spec()
+            &&& post.bodies@.len() == w.bodies@.len()
+            &&& ok == crate::certificate::step_checks_pass(
+                    *w, post, cert, tol_v@, tol_p@, tol_j@)
+            &&& (ok ==> crate::certificate::step_certified(
+                    *w, post, cert, tol_v@, tol_p@, tol_j@))
+            &&& cert.tan_halfs@.len() == w.bodies@.len()
+            &&& cert.angle_entries@.len() == w.bodies@.len()
+            &&& cert.snaps@.len() == 0
+            &&& forall|k: int| 0 <= k < cert.rows@.len() ==> {
+                    let r = #[trigger] cert.rows@[k];
+                    &&& r.wf_spec()
+                    &&& r.a < post.bodies@.len()
+                    &&& r.b < post.bodies@.len()
+                }
+            &&& forall|i: int| 0 <= i < w.bodies@.len() ==> {
+                    let ti = #[trigger] cert.tan_halfs@[i];
+                    &&& ti.wf_spec()
+                    &&& crate::angle_ledger::t_in_symmetric_unit_interval(ti@)
+                }
+        },
+{
+    step_pipeline(w, tol_v, tol_p, tol_j)
+}
+
 /// The full engine step (SPEC §6): gravity → joint rows (none, phys-07)
 /// → rows → PGS → canonicalize → integrate → canonicalize → certify.
 /// Ok carries the post world and the StepCert the checker accepted;
@@ -1044,6 +1091,57 @@ pub fn step(w: &World, tol_v: &Scalar, tol_p: &Scalar, tol_j: &Scalar) -> (r: St
             &&& r->Ok_0.wf_spec()
             &&& crate::certificate::step_checks_pass(*w, r->Ok_0, r->Ok_1, tol_v@, tol_p@, tol_j@)
             &&& crate::certificate::step_certified(*w, r->Ok_0, r->Ok_1, tol_v@, tol_p@, tol_j@)
+        },
+{
+    match step_checked(w, tol_v, tol_p, tol_j) {
+        Result::Err(idx) => StepResult::Reject(RejectReason::AngleOutOfRange(idx)),
+        Result::Ok((post, cert, ok)) => {
+            if ok {
+                StepResult::Ok(post, cert)
+            } else {
+                StepResult::Reject(RejectReason::CertFailed)
+            }
+        },
+    }
+}
+
+/// The pipeline body shared by step() and step_checked.
+fn step_pipeline(
+    w: &World,
+    tol_v: &Scalar,
+    tol_p: &Scalar,
+    tol_j: &Scalar,
+) -> (out: Result<(World, StepCert, bool), usize>)
+    requires
+        w.wf_spec(),
+        tol_v.wf_spec(),
+        tol_p.wf_spec(),
+        tol_j.wf_spec(),
+        forall|i: int| 0 <= i < w.bodies@.len() ==> (#[trigger] w.bodies@[i]).shape.parts@.len()
+            >= 1,
+    ensures
+        out is Ok ==> {
+            let (post, cert, ok) = out->Ok_0;
+            &&& post.wf_spec()
+            &&& post.bodies@.len() == w.bodies@.len()
+            &&& ok == crate::certificate::step_checks_pass(
+                    *w, post, cert, tol_v@, tol_p@, tol_j@)
+            &&& (ok ==> crate::certificate::step_certified(
+                    *w, post, cert, tol_v@, tol_p@, tol_j@))
+            &&& cert.tan_halfs@.len() == w.bodies@.len()
+            &&& cert.angle_entries@.len() == w.bodies@.len()
+            &&& cert.snaps@.len() == 0
+            &&& forall|k: int| 0 <= k < cert.rows@.len() ==> {
+                    let r = #[trigger] cert.rows@[k];
+                    &&& r.wf_spec()
+                    &&& r.a < post.bodies@.len()
+                    &&& r.b < post.bodies@.len()
+                }
+            &&& forall|i: int| 0 <= i < w.bodies@.len() ==> {
+                    let ti = #[trigger] cert.tan_halfs@[i];
+                    &&& ti.wf_spec()
+                    &&& crate::angle_ledger::t_in_symmetric_unit_interval(ti@)
+                }
         },
 {
     // 1. gravity
@@ -1089,7 +1187,7 @@ pub fn step(w: &World, tol_v: &Scalar, tol_p: &Scalar, tol_j: &Scalar) -> (r: St
     // 6. integrate
     let integ = integrate_exec(w, pb2);
     match integ {
-        Result::Err(idx) => StepResult::Reject(RejectReason::AngleOutOfRange(idx)),
+        Result::Err(idx) => Result::Err(idx),
         Result::Ok((nb, errs, ts, entries)) => {
             let mut nb2 = nb;
             proof {
@@ -1163,11 +1261,22 @@ pub fn step(w: &World, tol_v: &Scalar, tol_p: &Scalar, tol_j: &Scalar) -> (r: St
             };
             // 9. certify
             let ok = crate::certificate::check_step(w, &post, &cert, tol_v, tol_p, tol_j);
-            if ok {
-                StepResult::Ok(post, cert)
-            } else {
-                StepResult::Reject(RejectReason::CertFailed)
+            proof {
+                assert forall|k: int| 0 <= k < cert.rows@.len() implies {
+                    let r = #[trigger] cert.rows@[k];
+                    &&& r.wf_spec()
+                    &&& r.a < post.bodies@.len()
+                    &&& r.b < post.bodies@.len()
+                } by {
+                }
+                assert forall|i: int| 0 <= i < w.bodies@.len() implies {
+                    let ti = #[trigger] cert.tan_halfs@[i];
+                    &&& ti.wf_spec()
+                    &&& crate::angle_ledger::t_in_symmetric_unit_interval(ti@)
+                } by {
+                }
             }
+            Result::Ok((post, cert, ok))
         },
     }
 }

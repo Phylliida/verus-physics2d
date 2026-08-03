@@ -1251,9 +1251,13 @@ pub open spec fn world_energy(bodies: Seq<Body>, g: Vec2<Rational>) -> Rational 
     ke_sum(bodies, bodies.len() as int).add_spec(pe_sum(bodies, g, bodies.len() as int))
 }
 
-/// C7 (exact energy ledger, SPEC §7): E(post) ≤ E(pre) + W_drift + W_proj
-/// + W_snaps, all terms exactly computed. 06a: W_proj = W_snaps = 0
-/// (no projection yet, no snaps yet).
+/// C7 (exact energy ledger, SPEC §7 as resolved — D13): dissipation is
+/// nonnegative and exactly computed: D = E(pre) + W_proj + W_snaps −
+/// E(post) ≥ 0. NO drift allowance: the symplectic drift is itself
+/// dissipative (free flight: D = g²dt²/2·(1/inv_m) > 0), and the
+/// SPEC's negative W_drift term would forbid the honest ΔE = 0 of a
+/// resting contact (measured: C7 rejected rest). 06a: W_proj = W_snaps
+/// = 0 (no projection yet, no snaps yet).
 pub open spec fn c7_energy_ledger(
     pre: World,
     post: World,
@@ -1264,8 +1268,7 @@ pub open spec fn c7_energy_ledger(
 {
     let e_pre = world_energy(pre.bodies@, pre.gravity.model@);
     let e_post = world_energy(post.bodies@, post.gravity.model@);
-    let drift = w_drift_sum(pre.bodies@, pre.gravity.model@, pre.dt@, pre.bodies@.len() as int);
-    e_post.le_spec(e_pre.add_spec(drift).add_spec(w_proj).add_spec(w_snaps))
+    e_post.le_spec(e_pre.add_spec(w_proj).add_spec(w_snaps))
 }
 
 /// C7 exec: fold KE/PE/drift, compare (ok == its spec).
@@ -1281,10 +1284,8 @@ pub fn check_c7_energy(pre: &World, post: &World) -> (ok: bool)
     let two = RuntimeRational::from_int(2);
     let mut ke = RuntimeRational::from_int(0);
     let mut pe = RuntimeRational::from_int(0);
-    let mut drift = RuntimeRational::from_int(0);
     let mut ke_post = RuntimeRational::from_int(0);
     let mut pe_post = RuntimeRational::from_int(0);
-    let g2 = pre.gravity.x.mul(&pre.gravity.x).add(&pre.gravity.y.mul(&pre.gravity.y));
     let mut i: usize = 0;
     while i < pre.bodies.len()
         invariant
@@ -1296,16 +1297,12 @@ pub fn check_c7_energy(pre: &World, post: &World) -> (ok: bool)
             two.wf_spec(),
             one@ == Rational::from_int_spec(1),
             two@ == Rational::from_int_spec(2),
-            g2.wf_spec(),
-            g2@ == vdot(pre.gravity.model@, pre.gravity.model@),
             ke.wf_spec(),
             pe.wf_spec(),
-            drift.wf_spec(),
             ke_post.wf_spec(),
             pe_post.wf_spec(),
             ke@ == ke_sum(pre.bodies@, i as int),
             pe@ == pe_sum(pre.bodies@, pre.gravity.model@, i as int),
-            drift@ == w_drift_sum(pre.bodies@, pre.gravity.model@, pre.dt@, i as int),
             ke_post@ == ke_sum(post.bodies@, i as int),
             pe_post@ == pe_sum(post.bodies@, post.gravity.model@, i as int),
         decreases pre.bodies.len() - i,
@@ -1336,18 +1333,12 @@ pub fn check_c7_energy(pre: &World, post: &World) -> (ok: bool)
             ke = ke.add(&ke1.add(&ke2));
             let gd = pre.gravity.x.mul(&pb.pos.x).add(&pre.gravity.y.mul(&pb.pos.y));
             pe = pe.add(&one.div(&pb.inv_mass).mul(&gd).neg());
-            let wd = one.div(&pb.inv_mass).mul(&g2).mul(&pre.dt).mul(&pre.dt).div(&two).neg();
-            drift = drift.add(&wd);
             proof {
                 assert(ke@ == ke_sum(pre.bodies@, (i + 1) as int)) by {
                     reveal_with_fuel(ke_sum, 2);
                 };
                 assert(pe@ == pe_sum(pre.bodies@, pre.gravity.model@, (i + 1) as int)) by {
                     reveal_with_fuel(pe_sum, 2);
-                };
-                assert(drift@ == w_drift_sum(
-                    pre.bodies@, pre.gravity.model@, pre.dt@, (i + 1) as int)) by {
-                    reveal_with_fuel(w_drift_sum, 2);
                 };
             }
         } else {
@@ -1357,10 +1348,6 @@ pub fn check_c7_energy(pre: &World, post: &World) -> (ok: bool)
                 };
                 assert(pe@ == pe_sum(pre.bodies@, pre.gravity.model@, (i + 1) as int)) by {
                     reveal_with_fuel(pe_sum, 2);
-                };
-                assert(drift@ == w_drift_sum(
-                    pre.bodies@, pre.gravity.model@, pre.dt@, (i + 1) as int)) by {
-                    reveal_with_fuel(w_drift_sum, 2);
                 };
             }
         }
@@ -1414,13 +1401,13 @@ pub fn check_c7_energy(pre: &World, post: &World) -> (ok: bool)
     let e_pre = ke.add(&pe);
     let e_post = ke_post.add(&pe_post);
     let zero = RuntimeRational::from_int(0);
-    let allowance = e_pre.add(&drift).add(&zero).add(&zero);
+    let allowance = e_pre.add(&zero).add(&zero);
     proof {
         assert(e_pre@ == world_energy(pre.bodies@, pre.gravity.model@));
         assert(e_post@ == world_energy(post.bodies@, post.gravity.model@));
         assert(zero@ == Rational::from_int_spec(0));
-        Rational::lemma_add_zero_identity(e_pre@.add_spec(drift@));
-        Rational::lemma_add_zero_identity(e_pre@.add_spec(drift@).add_spec(zero@));
+        Rational::lemma_add_zero_identity(e_pre@);
+        Rational::lemma_add_zero_identity(e_pre@.add_spec(zero@));
     }
     e_post.le(&allowance)
 }

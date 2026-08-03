@@ -48,9 +48,23 @@ fn main() {
     let tol_j = ri(0);
 
     for i in 0..140 {
-        match step(&w, &tol_v, &tol_p, &tol_j) {
+        let t0 = std::time::Instant::now();
+        let r = step(&w, &tol_v, &tol_p, &tol_j);
+        let ms = t0.elapsed().as_secs_f64() * 1000.0;
+        if i >= 100 {
+            let b = &w.bodies[1];
+            println!(
+                "pre {:3}: {:.1}ms  vel=({},{}) om=({},{})",
+                i, ms,
+                b.vel.y.numerator.magnitude.limbs_le.len(),
+                b.vel.y.denominator.limbs_le.len(),
+                b.omega.numerator.magnitude.limbs_le.len(),
+                b.omega.denominator.limbs_le.len(),
+            );
+        }
+        match r {
             StepResult::Ok(w2, cert) => {
-                if i % 20 == 0 || (i > 100 && i < 115) || i > 190 {
+                if i % 20 == 0 || (i > 100 && i < 120) {
                     let y = &w2.bodies[1].pos.y;
                     let vy = &w2.bodies[1].vel.y;
                     println!(

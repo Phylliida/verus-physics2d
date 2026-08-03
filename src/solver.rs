@@ -362,6 +362,83 @@ pub fn build_rows_exec(bodies: &Vec<Body>, aabbs: &Vec<Aabb>) -> (out: (Vec<Row>
 /// the rows in construction order. wf-only: bodies stay wf, row J/bounds
 /// unchanged (only λ mutates), lengths constant. The certificate is the
 /// claim — nothing else is proved here.
+/// One PGS row update: solve λ′, clamp, normalize (D10), apply the
+/// impulse delta to both bodies, normalize the results. Value-preserving
+/// up to eqv; everything structural (J, bounds, pos/rot/inv/shape) is
+/// preserved exactly.
+pub fn pgs_row_update_exec(
+    r: &Row,
+    ba: &Body,
+    bb: &Body,
+    meff: &Scalar,
+) -> (out: (Row, Body, Body))
+    requires
+        r.wf_spec(),
+        ba.wf_spec(),
+        bb.wf_spec(),
+        meff.wf_spec(),
+        meff@ == eff_mass_spec(
+            r.jla.model@, r.jaa@, r.jlb.model@, r.jab@,
+            ba.inv_mass@, ba.inv_inertia@, bb.inv_mass@, bb.inv_inertia@),
+        Rational::from_int_spec(0).lt_spec(meff@),
+        bounds_consistent(r.lo.val(), r.hi.val()),
+    ensures
+        out.0.wf_spec(),
+        out.0.a == r.a,
+        out.0.b == r.b,
+        out.0.jla.model@ == r.jla.model@,
+        out.0.jaa@ == r.jaa@,
+        out.0.jlb.model@ == r.jlb.model@,
+        out.0.jab@ == r.jab@,
+        out.0.lo.val() == r.lo.val(),
+        out.0.hi.val() == r.hi.val(),
+        out.0.bias@ == r.bias@,
+        out.1.wf_spec(),
+        out.1.pos.model@ == ba.pos.model@,
+        out.1.rot.c@ == ba.rot.c@,
+        out.1.rot.s@ == ba.rot.s@,
+        out.1.inv_mass@ == ba.inv_mass@,
+        out.1.inv_inertia@ == ba.inv_inertia@,
+        out.1.shape.model_parts() == ba.shape.model_parts(),
+        out.2.wf_spec(),
+        out.2.pos.model@ == bb.pos.model@,
+        out.2.rot.c@ == bb.rot.c@,
+        out.2.rot.s@ == bb.rot.s@,
+        out.2.inv_mass@ == bb.inv_mass@,
+        out.2.inv_inertia@ == bb.inv_inertia@,
+        out.2.shape.model_parts() == bb.shape.model_parts(),
+{
+    let lam = solve_row_lambda_exec(r, ba, bb, meff);
+    // canonicalize λ and Δλ (D10, value-preserving): each PGS division
+    // multiplies denominators ~50×; normalize inside the sweep or 16
+    // iterations are infeasible (measured live)
+    let lam = lam.normalize();
+    let dlam = lam.sub(&r.lambda).normalize();
+    let new_r = row_with_lambda(r, &lam);
+    let new_a = apply_impulse_exec(ba, &r.jla, &r.jaa, &dlam);
+    let new_b = apply_impulse_exec(bb, &r.jlb, &r.jab, &dlam);
+    // canonicalize the updated velocities/omegas (same reason)
+    let new_a = Body {
+        pos: new_a.pos,
+        rot: new_a.rot,
+        vel: crate::types::SVec2::new(new_a.vel.x.normalize(), new_a.vel.y.normalize()),
+        omega: new_a.omega.normalize(),
+        inv_mass: new_a.inv_mass,
+        inv_inertia: new_a.inv_inertia,
+        shape: new_a.shape,
+    };
+    let new_b = Body {
+        pos: new_b.pos,
+        rot: new_b.rot,
+        vel: crate::types::SVec2::new(new_b.vel.x.normalize(), new_b.vel.y.normalize()),
+        omega: new_b.omega.normalize(),
+        inv_mass: new_b.inv_mass,
+        inv_inertia: new_b.inv_inertia,
+        shape: new_b.shape,
+    };
+    (new_r, new_a, new_b)
+}
+
 pub fn pgs_sweep_exec(
     bodies: &Vec<Body>,
     rows: &Vec<Row>,
@@ -561,15 +638,8 @@ pub fn pgs_sweep_exec(
             let r = &rs[ri2];
             let ra_idx = r.a;
             let rb_idx = r.b;
-            let lam = solve_row_lambda_exec(r, &bs[ra_idx], &bs[rb_idx], &meffs[ri2]);
-            let dlam = lam.sub(&r.lambda);
-            let jla = copy_svec2(&r.jla);
-            let jaa = verus_rational::runtime_rational::copy_rational(&r.jaa);
-            let jlb = copy_svec2(&r.jlb);
-            let jab = verus_rational::runtime_rational::copy_rational(&r.jab);
-            let new_r = row_with_lambda(r, &lam);
-            let new_a = apply_impulse_exec(&bs[ra_idx], &jla, &jaa, &dlam);
-            let new_b = apply_impulse_exec(&bs[rb_idx], &jlb, &jab, &dlam);
+            let ghost pre_bs = bs@;
+            let (new_r, new_a, new_b) = pgs_row_update_exec(r, &bs[ra_idx], &bs[rb_idx], &meffs[ri2]);
             proof {
                 assert(bs@[ra_idx as int].inv_mass@ == bodies@[ra_idx as int].inv_mass@);
                 assert(bs@[ra_idx as int].inv_inertia@ == bodies@[ra_idx as int].inv_inertia@);
@@ -579,6 +649,21 @@ pub fn pgs_sweep_exec(
             bs.set(ra_idx, new_a);
             bs.set(rb_idx, new_b);
             rs.set(ri2, new_r);
+            proof {
+                assert forall|i: int| 0 <= i < bs@.len() implies {
+                    let b = #[trigger] bs@[i];
+                    &&& b.pos.model@ == bodies@[i].pos.model@
+                    &&& b.rot.c@ == bodies@[i].rot.c@
+                    &&& b.rot.s@ == bodies@[i].rot.s@
+                    &&& b.inv_mass@ == bodies@[i].inv_mass@
+                    &&& b.inv_inertia@ == bodies@[i].inv_inertia@
+                    &&& b.shape.model_parts() == bodies@[i].shape.model_parts()
+                } by {
+                    if i != ra_idx as int && i != rb_idx as int {
+                        assert(bs@[i] == pre_bs[i]);
+                    }
+                }
+            }
             ri2 = ri2 + 1;
         }
         iter = iter + 1;
